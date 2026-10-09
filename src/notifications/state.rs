@@ -19,9 +19,11 @@ pub struct Observation {
     pub unknown: Option<String>,
 }
 impl Evidence {
+    /// Capture bounded request or provider quota evidence using the current observation time.
     pub fn observe(&mut self, windows: &[Window], authoritative: bool) {
         self.observe_at(windows, authoritative, Utc::now());
     }
+    /// Capture valid quota windows with the provider poll start time for stale-response protection.
     pub fn observe_at(&mut self, windows: &[Window], authoritative: bool, at: DateTime<Utc>) {
         let windows: Vec<_> = windows.iter().filter(|w| valid_window(w)).cloned().collect();
         if windows.is_empty() {
@@ -29,6 +31,7 @@ impl Evidence {
         }
         self.push(windows, authoritative, None, at);
     }
+    /// Record a model-scoped rejection without inventing a quota window or reset estimate.
     pub fn exhaust(&mut self, model: &str) {
         let scope = if model.contains("opus") {
             "opus"
@@ -39,6 +42,7 @@ impl Evidence {
         };
         self.push(Vec::new(), false, Some(scope.into()), Utc::now());
     }
+    /// Assign an evidence sequence and flag overflow when the bounded observation queue drops data.
     fn push(&mut self, windows: Vec<Window>, authoritative: bool, unknown: Option<String>, at: DateTime<Utc>) {
         self.sequence = self.sequence.saturating_add(1);
         if self.observations.len() == 128 {
@@ -48,6 +52,7 @@ impl Evidence {
         self.observations.push_back(Observation { sequence: self.sequence, at, windows, authoritative, unknown });
     }
 }
+/// Accept only finite usage percentages and the supported shared or model-scoped window names.
 pub fn valid_window(w: &Window) -> bool {
     w.used.is_finite()
         && (0.0..=100.0).contains(&w.used)
@@ -83,6 +88,7 @@ pub struct Event {
     pub remaining_blockers: Vec<String>,
 }
 impl Subscription {
+    /// Reduce fresh quota evidence into exhaustion or confirmed recovery events; elapsed timers never recover.
     pub fn apply(&mut self, id: &str, observation: &Observation) -> Vec<Event> {
         let mut transitions = Vec::new();
         let mut observations: Vec<_> = observation
@@ -195,13 +201,16 @@ impl Subscription {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Wrap deterministic window samples as authoritative provider evidence.
     fn obs(windows: Vec<Window>) -> Observation {
         Observation { sequence: 1, at: Utc::now(), windows, authoritative: true, unknown: None }
     }
+    /// Construct a bounded shared-window sample with a future reset estimate.
     fn window(name: &str, used: f64) -> Window {
         Window { name: name.into(), used, resets_at: None, model: None }
     }
     #[test]
+    /// Verify that exhaustion is deduplicated and partial recovery preserves week.
     fn exhaustion_is_deduplicated_and_partial_recovery_preserves_week() {
         let mut sub = Subscription::default();
         let used = obs(vec![window("5h", 100.0), window("week", 100.0)]);
@@ -215,6 +224,7 @@ mod tests {
         assert_eq!(recovered[0].event, "quota.available");
     }
     #[test]
+    /// Verify that expired missing and stale samples cannot recover.
     fn expired_missing_and_stale_samples_cannot_recover() {
         let mut sub = Subscription::default();
         let used = obs(vec![window("5h", 100.0)]);
@@ -229,6 +239,7 @@ mod tests {
         assert!(sub.windows.values().all(|w| w.exhausted));
     }
     #[test]
+    /// Verify that unknown requires full authoritative evidence and model scope.
     fn unknown_requires_full_authoritative_evidence_and_model_scope() {
         let mut sub = Subscription::default();
         let mut unknown = obs(vec![]);
@@ -239,6 +250,7 @@ mod tests {
         assert_eq!(recovered.len(), 1);
     }
     #[test]
+    /// Verify that headers cannot recover and provider reads started before exhaustion are stale.
     fn headers_cannot_recover_and_provider_reads_started_before_exhaustion_are_stale() {
         let mut sub = Subscription::default();
         let used = obs(vec![window("5h", 100.0)]);
@@ -255,6 +267,7 @@ mod tests {
         assert_eq!(recovered[0].event, "quota.available");
     }
     #[test]
+    /// Verify that model scoped week stays a blocker after shared window recovers.
     fn model_scoped_week_stays_a_blocker_after_shared_window_recovers() {
         let mut sub = Subscription::default();
         let opus = Window { name: "week opus".into(), model: Some("opus".into()), ..window("week", 100.0) };

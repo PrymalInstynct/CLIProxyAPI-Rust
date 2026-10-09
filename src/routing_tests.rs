@@ -38,6 +38,7 @@ struct QuotaGate {
     resume: tokio::sync::Notify,
 }
 impl Mock {
+    /// Wait for the mock provider to pause a response while newer quota evidence is applied.
     async fn await_quota_gate(&self, account: &str) {
         let gate = if account == "a" { self.quota_gate.lock().take() } else { None };
         if let Some(gate) = gate {
@@ -140,6 +141,7 @@ fn rich_events(response: &mut Value) -> Vec<Value> {
     out
 }
 
+/// Handle synthetic HTTP provider requests and coordinate delayed quota-response tests.
 async fn mock_http(State(mock): State<Arc<Mock>>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
     let account = account(&headers);
     mock.calls.lock().push((account.clone(), body.clone(), "http"));
@@ -199,6 +201,7 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, Json(body)
     .into_response()
 }
 
+/// Handle synthetic native WebSocket turns with deterministic quota and disconnect scenarios.
 async fn mock_ws(State(mock): State<Arc<Mock>>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
     let account = account(&headers);
     upgrade.on_upgrade(move |socket| async move {
@@ -717,6 +720,7 @@ async fn quota_headers_and_stream_errors_trigger_migration_on_the_next_call() {
 }
 
 #[tokio::test]
+/// Verify that delayed http json and sse quota errors preserve newer recovery.
 async fn delayed_http_json_and_sse_quota_errors_preserve_newer_recovery() {
     for (mode, converted) in [(1, false), (4, false), (7, false), (4, true), (7, true)] {
         for newer_epoch in [false, true] {
@@ -776,6 +780,7 @@ async fn delayed_http_json_and_sse_quota_errors_preserve_newer_recovery() {
 }
 
 #[tokio::test]
+/// Verify that reused native websocket turn captures its own quota epoch.
 async fn reused_native_websocket_turn_captures_its_own_quota_epoch() {
     for newer_epoch in [false, true] {
         let fixture = Fixture::new(Routing::RoundRobin, true).await;
@@ -1334,6 +1339,7 @@ async fn websocket_without_client_identity_warns_that_affinity_is_connection_onl
 }
 
 #[tokio::test]
+/// Verify that websocket native selection preserves decision when api keys require http fallback.
 async fn websocket_native_selection_preserves_decision_when_api_keys_require_http_fallback() {
     let fixture = Fixture::new(Routing::RoundRobin, false).await;
     let mut cfg = fixture.cfg.clone();

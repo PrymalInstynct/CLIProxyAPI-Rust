@@ -15,6 +15,7 @@ pub struct Credentials {
     bearer: Option<HeaderValue>,
 }
 // Intentionally no Debug/Serialize; the URL itself is a credential.
+/// Resolve external URL/token bindings from the environment or bounded private secret files.
 pub fn credentials(dir: &Path, d: &Destination) -> Result<Credentials, &'static str> {
     if !super::valid_id(&d.id) {
         return Err("invalid_destination");
@@ -40,6 +41,10 @@ pub fn credentials(dir: &Path, d: &Destination) -> Result<Credentials, &'static 
                 let mut component = std::path::PathBuf::new();
                 for part in dir.components() {
                     component.push(part);
+                    // A Windows drive/UNC prefix is not a filesystem entry until its root is appended.
+                    if matches!(part, std::path::Component::Prefix(_)) {
+                        continue;
+                    }
                     if std::fs::symlink_metadata(&component)
                         .map_err(|_| "credential_unavailable")?
                         .file_type()
@@ -64,6 +69,7 @@ pub fn credentials(dir: &Path, d: &Destination) -> Result<Credentials, &'static 
     }
     parse_credentials(&url, bearer.as_deref())
 }
+/// Accept only bounded HTTPS URLs without userinfo or fragments and validate the bearer header.
 pub fn parse_credentials(url: &str, bearer: Option<&str>) -> Result<Credentials, &'static str> {
     if url.len() > 8192 || bearer.is_some_and(|token| token.len() > 8192) {
         return Err("credential_too_large");
@@ -88,6 +94,7 @@ pub fn parse_credentials(url: &str, bearer: Option<&str>) -> Result<Credentials,
         .transpose()?;
     Ok(Credentials { url, bearer })
 }
+/// Detect external bindings even when malformed so managed credentials cannot override them.
 pub fn external_present(dir: &Path, d: &Destination) -> bool {
     if !super::valid_id(&d.id) {
         return false;
@@ -101,6 +108,7 @@ pub fn external_present(dir: &Path, d: &Destination) -> bool {
             }
         })
 }
+/// Resolve the authoritative external source first, otherwise load the managed bundle.
 pub fn resolved_credentials(dir: &Path, root: &Path, d: &Destination) -> Result<Credentials, &'static str> {
     if !super::valid_id(&d.id) {
         return Err("invalid_destination");
@@ -122,6 +130,7 @@ pub struct Outcome {
     pub retry_after: Option<i64>,
 }
 impl Outcome {
+    /// Return a fixed diagnostic category without retaining raw transport errors or credential values.
     fn error(reason: &'static str, retry: bool) -> Self {
         Self { success: false, retry, status: None, reason, retry_after: None }
     }
@@ -133,22 +142,27 @@ pub struct Presentation {
     provider_logos: bool,
 }
 impl Presentation {
+    /// Resolve a sanitized display name and time zone for this delivery without persisting either.
     pub fn new(name: Option<&str>, time_zone: chrono_tz::Tz) -> Self {
         Self { display_name: name.map(safe_name), time_zone, provider_logos: true }
     }
+    /// Apply the current Discord thumbnail preference to this delivery.
     pub fn with_provider_logos(mut self, enabled: bool) -> Self {
         self.provider_logos = enabled;
         self
     }
+    /// Format human timestamps in the selected zone without visible zone names or offsets.
     fn local(&self, at: chrono::DateTime<chrono::Utc>) -> String {
         at.with_timezone(&self.time_zone).format("%Y-%m-%d %H:%M:%S").to_string()
     }
 }
+/// Bound display names and strip control and directional characters before presenting them.
 pub fn safe_name(name: &str) -> String {
     let name:String=name.chars().filter(|c|!c.is_control()&&!matches!(*c,'\u{061c}'|'\u{200b}'..='\u{200f}'|'\u{2028}'..='\u{202e}'|'\u{2066}'..='\u{2069}'|'\u{feff}')).take(160).collect();
     let name = name.trim();
     if name.is_empty() { "Subscription".into() } else { name.into() }
 }
+/// Escape display names for the target chat format without enabling mentions or markup.
 fn chat_name(name: &str, format: Format) -> String {
     let mut escaped = String::new();
     for c in name.chars() {
@@ -176,6 +190,7 @@ fn chat_name(name: &str, format: Format) -> String {
     }
     escaped
 }
+/// Translate supported quota scopes into readable limit labels.
 fn limit_label(window: &str, model: Option<&str>) -> &'static str {
     match (window, model) {
         ("5h", _) => "5-hour limit",
@@ -189,6 +204,7 @@ fn limit_label(window: &str, model: Option<&str>) -> &'static str {
         _ => "Subscription quota",
     }
 }
+/// Describe exhaustion, partial recovery, or full availability using local times and current identity.
 fn text(e: &Event, presentation: &Presentation, format: Format) -> String {
     if e.event == "notification.test" {
         return format!("Notification delivery test\nSent: {}", presentation.local(e.observed_at));
@@ -218,6 +234,7 @@ fn text(e: &Event, presentation: &Presentation, format: Format) -> String {
     }
     text
 }
+/// Build the platform-specific request while preserving generic event IDs and UTC timestamps.
 pub fn payload(d: &Destination, e: &Event, presentation: &Presentation) -> Value {
     let text = text(e, presentation, d.format);
     match d.format {
@@ -271,6 +288,7 @@ static CODEX_LOGO: Logo = Logo {
     color: 0x10A37F,
     bytes: include_bytes!("assets/codex.png"),
 };
+/// Select bundled Discord thumbnails only when enabled and the event identifies a supported provider.
 fn logos(d: &Destination, e: &Event, presentation: &Presentation) -> Vec<&'static Logo> {
     if d.format != Format::Discord || !presentation.provider_logos {
         return Vec::new();
@@ -287,6 +305,7 @@ fn logos(d: &Destination, e: &Event, presentation: &Presentation) -> Vec<&'stati
         _ => Vec::new(),
     }
 }
+/// Encode Discord JSON and bundled PNG attachments using a fresh multipart boundary.
 fn multipart_body(payload: &Value, logos: &[&Logo]) -> (String, Vec<u8>) {
     let json = payload.to_string();
     // Everything outside JSON is fixed metadata. Random boundaries are also checked
@@ -309,6 +328,7 @@ fn multipart_body(payload: &Value, logos: &[&Logo]) -> (String, Vec<u8>) {
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
     (format!("multipart/form-data; boundary={boundary}"), body)
 }
+/// Check IPv4 or IPv6 prefix membership without DNS resolution.
 pub fn cidr_contains(cidr: &str, ip: IpAddr) -> bool {
     let Some((network, bits)) = cidr.split_once('/') else {
         return false;
@@ -331,18 +351,21 @@ pub fn cidr_contains(cidr: &str, ip: IpAddr) -> bool {
         _ => false,
     }
 }
+/// Normalize IPv4-mapped IPv6 addresses before applying network permissions.
 fn normalize(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v) => v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
         _ => ip,
     }
 }
+/// Recognize only RFC1918 IPv4 and IPv6 unique-local addresses eligible for explicit exceptions.
 fn private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v) => v.is_private(),
         IpAddr::V6(v) => (v.segments()[0] & 0xfe00) == 0xfc00,
     }
 }
+/// Exclude private, metadata, documentation, transition, and other special-use destination addresses.
 pub fn public(ip: IpAddr) -> bool {
     let ip = normalize(ip);
     match ip {
@@ -375,6 +398,7 @@ pub fn public(ip: IpAddr) -> bool {
         }
     }
 }
+/// Allow public addresses or exact private host/port/CIDR exceptions; never allow metadata or loopback.
 pub fn allowed(ip: IpAddr, host: &str, port: u16, endpoints: &[PrivateEndpoint]) -> bool {
     let ip = normalize(ip);
     if ip == "fd00:ec2::254".parse::<IpAddr>().unwrap() {
@@ -391,6 +415,7 @@ pub fn allowed(ip: IpAddr, host: &str, port: u16, endpoints: &[PrivateEndpoint])
                 && entry.cidrs.iter().any(|c| cidr_contains(c, ip))
         })
 }
+/// Vet every resolved address and pin connections to that set while retaining TLS verification.
 async fn client(
     url: &Url,
     endpoints: &[PrivateEndpoint],
@@ -434,6 +459,7 @@ async fn client(
     }
     builder.build().map_err(|_| "transport_unavailable")
 }
+/// Disable ambient proxies, redirects, automatic retries, and decompression; bound transport time.
 fn isolated_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .no_proxy()
@@ -448,6 +474,7 @@ fn isolated_builder() -> reqwest::ClientBuilder {
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15))
 }
+/// Resolve current credentials and network policy, then attempt one sanitized webhook delivery.
 pub async fn send(
     dir: &Path,
     endpoints: &[PrivateEndpoint],
@@ -467,6 +494,7 @@ pub async fn send(
     };
     dispatch(client, secret, d, e, presentation).await
 }
+/// Send the platform payload and validate a bounded acknowledgement without exposing response bodies.
 async fn dispatch(
     client: reqwest::Client,
     mut secret: Credentials,
@@ -537,6 +565,7 @@ async fn dispatch(
 }
 struct DateTimeParser;
 impl DateTimeParser {
+    /// Convert an HTTP-date Retry-After header into a delay relative to the current time.
     fn seconds(value: &str) -> Option<i64> {
         chrono::DateTime::parse_from_rfc2822(value)
             .ok()
@@ -549,6 +578,7 @@ mod logo_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Create a deterministic credential-free event for payload tests.
     fn event() -> Event {
         Event {
             version: 1,
@@ -564,10 +594,12 @@ mod tests {
             remaining_blockers: vec!["5h".into()],
         }
     }
+    /// Construct a synthetic target format for acknowledgement tests.
     fn destination(format: Format) -> Destination {
         Destination { id: "test".into(), format, enabled: true, chat_id: Some("1234".into()) }
     }
     #[test]
+    /// Verify that human times follow dst and generic keeps original machine identity and utc times.
     fn human_times_follow_dst_and_generic_keeps_original_machine_identity_and_utc_times() {
         let event = event();
         let presentation = Presentation::new(Some("My subscription"), chrono_tz::America::Denver);
@@ -588,6 +620,7 @@ mod tests {
         assert_eq!(generic["resets_at"], json!(event.resets_at));
     }
     #[test]
+    /// Verify that chat messages distinguish exhaustion partial recovery and full availability.
     fn chat_messages_distinguish_exhaustion_partial_recovery_and_full_availability() {
         let mut event = event();
         event.provider = "codex".into();
@@ -628,6 +661,7 @@ mod tests {
         assert!(text(&event, &presentation, Format::Discord).ends_with("Estimated reset: not provided"));
     }
     #[test]
+    /// Verify that chat platforms preserve readable messages and safe payload contracts.
     fn chat_platforms_preserve_readable_messages_and_safe_payload_contracts() {
         let event = event();
         let presentation = Presentation::new(Some("Work account"), chrono_tz::UTC);
@@ -666,6 +700,7 @@ mod tests {
         }
     }
     #[test]
+    /// Verify that display names are bounded single line and cannot add mentions links or markdown.
     fn display_names_are_bounded_single_line_and_cannot_add_mentions_links_or_markdown() {
         let malicious = "\u{202e}@everyone [click](https://evil.example) <@U123>\r\n";
         let safe = safe_name(malicious);
@@ -701,6 +736,7 @@ mod tests {
         }
     }
     #[test]
+    /// Verify that test messages have no fake subscription or provider even for legacy events.
     fn test_messages_have_no_fake_subscription_or_provider_even_for_legacy_events() {
         let mut event = event();
         event.event = "notification.test".into();
@@ -717,6 +753,7 @@ mod tests {
         assert!(generic.get("subscription_display_name").is_none());
     }
     #[tokio::test]
+    /// Verify that isolated transport refuses redirects bounds responses and checks acknowledgements.
     async fn isolated_transport_refuses_redirects_bounds_responses_and_checks_acknowledgements() {
         use axum::{
             Router,
@@ -841,6 +878,7 @@ mod tests {
         let _ = server.await;
     }
     #[test]
+    /// Verify that special addresses and mapped ipv6 cannot bypass filter.
     fn special_addresses_and_mapped_ipv6_cannot_bypass_filter() {
         for ip in [
             "127.0.0.1",
@@ -864,6 +902,7 @@ mod tests {
         }
     }
     #[test]
+    /// Verify that private allowlist is exact host port and subnet.
     fn private_allowlist_is_exact_host_port_and_subnet() {
         let allow = vec![PrivateEndpoint { host: "chat.example".into(), port: 443, cidrs: vec!["10.1.0.0/16".into()] }];
         assert!(allowed("10.1.2.3".parse().unwrap(), "chat.example", 443, &allow));

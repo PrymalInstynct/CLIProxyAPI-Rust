@@ -117,6 +117,7 @@ fn openai_base(app: &App, acct: &Account, headers: &HeaderMap, model: &str) -> (
     (base, headers)
 }
 
+/// Track the request quota epoch before sending an authenticated upstream media operation.
 async fn send(
     app: &App,
     acct: &Account,

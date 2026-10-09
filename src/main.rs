@@ -99,6 +99,7 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Initialize the shared proxy and optional notification worker alongside existing background tasks.
 async fn serve(app: Arc<App>) -> Result<()> {
     let cfg = app.cfg();
     if !cfg.is_loopback() && cfg.api_keys.is_empty() {

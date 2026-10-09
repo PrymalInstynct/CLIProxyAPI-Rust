@@ -541,6 +541,7 @@ impl Account {
         self.state.lock().quota_epoch
     }
 
+    /// Apply a model quota rejection only if its request predates no newer usage or reset evidence.
     pub fn cool_quota(&self, model: &str, until: DateTime<Utc>, reason: &str, epoch: u64) {
         let mut st = self.state.lock();
         if st.quota_epoch == epoch && !st.quota_refreshing && !st.disabled {
@@ -931,6 +932,7 @@ impl Pool {
         };
         allowed.then(|| a.resolve_with(model, matches!(only, Some(Only::Provider(_))))).flatten()
     }
+    /// Rebuild configured accounts while preserving compatible state and invalidating paused evidence.
     pub fn reload(&self, cfg: &Config) {
         self.force_prefix.store(cfg.force_model_prefix, std::sync::atomic::Ordering::Relaxed);
         let specs = collect(cfg);

@@ -36,6 +36,7 @@ pub struct App {
 }
 
 impl App {
+    /// Construct shared application state with startup-pinned notification permissions and lazy journal access.
     pub fn new(cfg: Config, cfg_path: PathBuf) -> Arc<Self> {
         let pool = Pool::default();
         pool.reload(&cfg);

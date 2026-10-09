@@ -13,7 +13,7 @@ The corresponding configuration is:
 ```yaml
 notifications:
   enabled: true
-  time-zone: America/Denver # notification timestamps; IANA time zone
+  time-zone: UTC # notification timestamps; choose an IANA time zone
   provider-logos: true # Discord-only provider logo thumbnails; default true
   credential-ui-enabled: false # opt in before entering secrets in the dashboard
   credential-public-url: https://proxy.example.com # optional HTTPS origin; hot-applied; leave blank for localhost/native TLS
@@ -78,7 +78,7 @@ When only one window recovers, the title identifies that window (for example, `5
 
 Managed credential bundles are stored as plaintext JSON at `auth-dir/.notification-credentials/<id>.json`, separately from `config.yaml`, in a private `0700` directory with `0600` files. Writes use a temporary file, atomic replacement, and filesystem sync. These permissions protect against other ordinary local users; they do not encrypt the credentials. The root user and anyone who can read host backups or snapshots can access them. Protect the auth directory and its backups accordingly. Many webhook URLs contain credentials in the path or query, so protect the complete URL.
 
-Managed credential writes are supported on Unix systems with these file permissions. On Windows, writes fail closed because equivalent ACL protection is not implemented; use the environment-variable or external secret-file methods below.
+Managed credential writes are supported on Unix systems with these file permissions. On Windows, writes fail closed because equivalent ACL protection is not implemented; use the environment-variable or external secret-file methods below. Provision Windows secret files and the auth directory with ACLs that restrict access to the service account and administrators; Unix ownership and mode checks are not available there.
 
 Credential saves accept only a valid saved destination ID. Credential deletion also accepts a valid fixed ID without a configured destination so an administrator can remove an orphaned managed bundle left by an offline YAML edit. New destinations cannot reuse an orphaned managed credential ID until that bundle is removed. Clean up managed credentials before offline deletion or renaming; the server cannot infer an old configuration when starting from an already-edited YAML file. `PUT /api/notifications/{id}/credentials` replaces the complete URL/token bundle; `DELETE /api/notifications/{id}/credentials` removes it and takes no body. PUT accepts same-origin JSON up to 20 KiB and returns only safe status. Its JSON fields are `url` and optional `bearer_token`; an empty or omitted token clears the prior token. Use the normal management `Authorization: Bearer` header when a management key is configured; query-string keys are not accepted. For example, use placeholders and a protected input method rather than putting real credentials in shell history:
 
@@ -134,7 +134,7 @@ services:
       - ./notification-secrets:/run/notification-secrets:ro
 ```
 
-Set the directory and secret file permissions on the host before starting the container. The notification state and durable delivery queue live under `auth-dir/.quota-notifications`; managed credentials live separately under `auth-dir/.notification-credentials`. Keep the auth directory persistent and writable.
+Set the directory and secret file permissions on the host before starting the container. The notification state and durable delivery queue live under `auth-dir/.quota-notifications`; managed credentials live separately under `auth-dir/.notification-credentials`. Keep the auth directory persistent and writable. These storage paths use the auth directory selected at startup; changing `auth-dir` requires a restart for notification storage to move.
 
 ### Environment variables
 
