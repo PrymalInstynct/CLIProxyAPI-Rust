@@ -37,6 +37,7 @@ pub struct Config {
     pub time_zone: String,
     pub provider_logos: bool,
     pub credential_ui_enabled: bool,
+    pub credential_public_url: String,
     pub credential_proxy_cidrs: Vec<String>,
     pub secrets_dir: Option<String>,
     pub ca_file: Option<String>,
@@ -50,6 +51,7 @@ impl Default for Config {
             time_zone: "UTC".into(),
             provider_logos: true,
             credential_ui_enabled: false,
+            credential_public_url: String::new(),
             credential_proxy_cidrs: Vec::new(),
             secrets_dir: None,
             ca_file: None,
@@ -95,6 +97,7 @@ pub fn valid_id(id: &str) -> bool {
 }
 impl Config {
     pub fn validate(&self) -> Result<(), String> {
+        credential_public_origin(&self.credential_public_url).map_err(|_|"notifications: credential-public-url must be an HTTPS origin without credentials, query, fragment or path".to_string())?;
         if self.credential_proxy_cidrs.len() > 16 {
             return Err("notifications: too many credential-proxy-cidrs".into());
         }
@@ -171,6 +174,37 @@ impl Config {
         }
         Ok(())
     }
+}
+/// The deployment's public HTTPS origin, never a webhook or credential-bearing URL.
+pub fn credential_public_origin(value: &str) -> Result<Option<String>, &'static str> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > 300
+        || value.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '\\' | '@' | '?' | '#'))
+    {
+        return Err("credential_public_url_invalid");
+    }
+    let (_, authority_and_path) = value.split_once("://").ok_or("credential_public_url_invalid")?;
+    let authority = authority_and_path.split('/').next().ok_or("credential_public_url_invalid")?;
+    if authority.contains('@') {
+        return Err("credential_public_url_invalid");
+    }
+    if authority_and_path.split_once('/').is_some_and(|(_, path)| !path.is_empty()) {
+        return Err("credential_public_url_invalid");
+    }
+    let url = url::Url::parse(value).map_err(|_| "credential_public_url_invalid")?;
+    if url.scheme() != "https"
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        return Err("credential_public_url_invalid");
+    }
+    Ok(Some(url.origin().ascii_serialization()))
 }
 struct Inner {
     store: Option<Store>,
@@ -267,7 +301,7 @@ impl Service {
                 })
                 .collect()
         });
-        json!({"enabled":cfg.notifications.enabled,"time_zone":cfg.notifications.time_zone,"credential_ui_enabled":cfg.notifications.credential_ui_enabled,"active":active,"error":error,"warning":warning,"pending":pending,"destinations":destinations,"logs":logs,"capabilities":{"supported":supported,"unsupported":unsupported},"private_endpoints_restart_required":true})
+        json!({"enabled":cfg.notifications.enabled,"time_zone":cfg.notifications.time_zone,"credential_ui_enabled":cfg.notifications.credential_ui_enabled,"credential_public_url":credential_public_origin(&cfg.notifications.credential_public_url).ok().flatten().unwrap_or_default(),"active":active,"error":error,"warning":warning,"pending":pending,"destinations":destinations,"logs":logs,"capabilities":{"supported":supported,"unsupported":unsupported},"private_endpoints_restart_required":true})
     }
     pub async fn test(&self, app: &App, id: &str) -> Result<Value, &'static str> {
         let cfg = app.cfg();
@@ -742,6 +776,40 @@ pub async fn worker(app: Arc<App>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn credential_public_url_is_a_strict_normalized_https_origin() {
+        assert_eq!(credential_public_origin(""), Ok(None));
+        assert_eq!(
+            credential_public_origin("https://DASHBOARD.example.test:443/"),
+            Ok(Some("https://dashboard.example.test".into()))
+        );
+        assert_eq!(
+            credential_public_origin("https://[2001:db8::1]:8443"),
+            Ok(Some("https://[2001:db8::1]:8443".into()))
+        );
+        for value in [
+            "http://dashboard.example.test",
+            "https://",
+            "https://user@dashboard.example.test",
+            "https://@dashboard.example.test",
+            "https://dashboard.example.test?",
+            "https://dashboard.example.test#",
+            "https://dashboard.example.test/.",
+            "https://dashboard.example.test/a/..",
+            "https://dashboard.example.test//",
+            " https://dashboard.example.test",
+            "https://dashboard.example.test ",
+            "https://dashboard.example.test\\",
+        ] {
+            assert_eq!(credential_public_origin(value), Err("credential_public_url_invalid"), "{value}");
+            let cfg = Config { credential_public_url: value.into(), ..Default::default() };
+            assert!(cfg.validate().is_err());
+        }
+        assert_eq!(
+            credential_public_origin(&format!("https://{}", "a".repeat(301))),
+            Err("credential_public_url_invalid")
+        );
+    }
     struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {

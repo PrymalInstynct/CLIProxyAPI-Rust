@@ -285,8 +285,9 @@ async fn credential_ui_is_opt_in_hot_reloadable_and_disabling_it_preserves_saved
     assert_eq!(disabled_status["credential_ui_enabled"], false);
     assert_eq!(disabled_status["credential_ui_ready"], false);
     assert_eq!(disabled_status["credential_ui_reason"], "credential_ui_disabled");
-    assert!(disabled_status["credential_proxy_peer"].is_string());
-    assert!(disabled_status["credential_proxy_cidr"].is_string());
+    assert_eq!(disabled_status["credential_public_url"], "");
+    assert!(disabled_status.get("credential_proxy_peer").is_none());
+    assert!(disabled_status.get("credential_proxy_cidr").is_none());
 
     let disabled_put = request().send().await.unwrap();
     assert_eq!(disabled_put.status(), StatusCode::FORBIDDEN);
@@ -372,6 +373,119 @@ async fn only_startup_trusted_proxy_cidrs_can_assert_a_single_https_forwarded_pr
         .await
         .unwrap();
     assert_eq!(multi_proto.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn configured_public_origin_is_exact_hot_reloadable_and_revocable_without_losing_secret() {
+    let temp = Temp::new();
+    let app = app(&temp, None);
+    let mut initial = (*app.cfg()).clone();
+    // This deployment setting is an admin browser Origin allowlist. The API below
+    // remains a loopback HTTP test server, so the header is not TLS attestation.
+    initial.notifications.credential_public_url = "HTTPS://ADMIN.EXAMPLE.INVALID:443".into();
+    app.set_config(initial);
+    let (origin, _server) = serve(app.clone()).await;
+    let client = reqwest::Client::new();
+    let route = credential_route(&origin, "ops");
+    let trusted_origin = "https://admin.example.invalid";
+    let first_secret = "public-origin-credential-sentinel";
+    let request_for_origin = |origin: &str, method: reqwest::Method| {
+        let request = client
+            .request(method, &route)
+            .bearer_auth(KEY)
+            .header("sec-fetch-site", "same-origin")
+            .json(&json!({"url":format!("https://hooks.example.invalid/{first_secret}")}));
+        if origin.is_empty() { request } else { request.header(reqwest::header::ORIGIN, origin) }
+    };
+
+    let status = client.get(format!("{origin}/api/notifications")).bearer_auth(KEY).send().await.unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    let status: Value = status.json().await.unwrap();
+    assert_eq!(status["credential_public_url"], trusted_origin);
+    assert!(status.get("credential_proxy_peer").is_none());
+    assert!(status.get("credential_proxy_cidr").is_none());
+
+    for wrong_origin in [
+        "",
+        "http://admin.example.invalid",
+        "https://admin.example.invalid:8443",
+        "https://admin.example.invalid.attacker.invalid",
+    ] {
+        let response = request_for_origin(wrong_origin, reqwest::Method::PUT).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "origin: {wrong_origin}");
+        assert!(!response.text().await.unwrap().contains(first_secret));
+    }
+    assert!(!temp.0.join("auth/.notification-credentials").exists());
+
+    let accepted = client
+        .put(&route)
+        .bearer_auth(KEY)
+        .header(reqwest::header::ORIGIN, trusted_origin)
+        .header("sec-fetch-site", "same-origin")
+        .header(reqwest::header::HOST, "attacker.invalid:9000")
+        .header("x-forwarded-proto", "http")
+        .header("x-forwarded-host", "spoofed-forwarded-host.invalid")
+        .header("x-forwarded-for", "203.0.113.9")
+        .json(&json!({"url":format!("https://hooks.example.invalid/{first_secret}")}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let credential_path = temp.0.join("auth/.notification-credentials/ops.json");
+    let saved = std::fs::read(&credential_path).unwrap();
+
+    let mut changed = (*app.cfg()).clone();
+    changed.notifications.credential_public_url = "https://portal.example.invalid".into();
+    app.set_config(changed);
+    let changed_status = client.get(format!("{origin}/api/notifications")).bearer_auth(KEY).send().await.unwrap();
+    assert_eq!(changed_status.status(), StatusCode::OK);
+    assert_eq!(
+        changed_status.json::<Value>().await.unwrap()["credential_public_url"],
+        "https://portal.example.invalid"
+    );
+
+    for method in [reqwest::Method::PUT, reqwest::Method::DELETE] {
+        let old_origin = request_for_origin(trusted_origin, method).send().await.unwrap();
+        assert_eq!(old_origin.status(), StatusCode::FORBIDDEN);
+        assert_eq!(std::fs::read(&credential_path).unwrap(), saved);
+    }
+
+    let new_secret = "replacement-public-origin-sentinel";
+    let updated = client
+        .put(&route)
+        .bearer_auth(KEY)
+        .header(reqwest::header::ORIGIN, "https://portal.example.invalid")
+        .header("sec-fetch-site", "same-origin")
+        .json(&json!({"url":format!("https://hooks.example.invalid/{new_secret}")}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated_secret = std::fs::read(&credential_path).unwrap();
+
+    let mut revoked = (*app.cfg()).clone();
+    revoked.notifications.credential_ui_enabled = false;
+    app.set_config(revoked);
+    let revoked_put = client
+        .put(&route)
+        .bearer_auth(KEY)
+        .header(reqwest::header::ORIGIN, "https://portal.example.invalid")
+        .header("sec-fetch-site", "same-origin")
+        .json(&json!({"url":"https://hooks.example.invalid/revoked"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked_put.status(), StatusCode::FORBIDDEN);
+    let revoked_delete = client
+        .delete(&route)
+        .bearer_auth(KEY)
+        .header(reqwest::header::ORIGIN, "https://portal.example.invalid")
+        .header("sec-fetch-site", "same-origin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked_delete.status(), StatusCode::FORBIDDEN);
+    assert_eq!(std::fs::read(&credential_path).unwrap(), updated_secret);
 }
 
 #[tokio::test]

@@ -683,11 +683,9 @@ async fn notification_status(
     req: Request,
 ) -> Response {
     let mut status = app.notifications.status(&app);
-    let guard = credential_guard(&app, peer.ip(), req.headers(), req.uri());
+    let guard = credential_guard(&app, peer.ip(), req.headers(), req.uri(), false);
     status["credential_ui_ready"] = json!(guard.is_ok());
     status["credential_ui_reason"] = json!(guard.err().unwrap_or("ready"));
-    status["credential_proxy_peer"] = json!(peer.ip().to_string());
-    status["credential_proxy_cidr"] = json!(format!("{}/{}", peer.ip(), if peer.is_ipv4() { 32 } else { 128 }));
     no_store(Json(status).into_response())
 }
 fn no_store(mut response: Response) -> Response {
@@ -726,6 +724,7 @@ fn credential_guard(
     peer: std::net::IpAddr,
     headers: &HeaderMap,
     uri: &axum::http::Uri,
+    mutation: bool,
 ) -> Result<(), &'static str> {
     let cfg = app.cfg();
     if !cfg.notifications.credential_ui_enabled {
@@ -741,6 +740,13 @@ fn credential_guard(
     }
     if single_header(headers, "sec-fetch-site")?.is_some_and(|site| !matches!(site, "same-origin" | "none")) {
         return Err("credential_cross_site_request_rejected");
+    }
+    if let Some(public_origin) =
+        crate::notifications::credential_public_origin(&cfg.notifications.credential_public_url)?
+    {
+        // Public-origin mode is an administrator's deployment trust decision. Host
+        // and forwarded headers cannot independently attest browser TLS behind a proxy.
+        return credential_origin_check(headers, &public_origin, mutation);
     }
     let header_host = single_header(headers, "host")?;
     let authority = uri.authority().map(|authority| authority.as_str());
@@ -777,17 +783,28 @@ fn credential_guard(
     {
         return Err("invalid_credential_request_host");
     }
-    if let Some(origin) = single_header(headers, "origin")? {
-        let origin = url::Url::parse(origin).map_err(|_| "credential_origin_mismatch")?;
-        if origin.path() != "/"
-            || origin.query().is_some()
-            || origin.fragment().is_some()
-            || !origin.username().is_empty()
-            || origin.password().is_some()
-            || origin.origin() != expected.origin()
-        {
-            return Err("credential_origin_mismatch");
-        }
+    credential_origin_check(headers, &expected.origin().ascii_serialization(), mutation)
+}
+fn credential_origin_check(headers: &HeaderMap, expected: &str, required: bool) -> Result<(), &'static str> {
+    let Some(origin) = single_header(headers, "origin")? else {
+        return if required { Err("credential_origin_required") } else { Ok(()) };
+    };
+    if origin.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '\\' | '@' | '?' | '#')) {
+        return Err("credential_origin_mismatch");
+    }
+    let (_, authority_and_path) = origin.split_once("://").ok_or("credential_origin_mismatch")?;
+    if authority_and_path.split_once('/').is_some_and(|(_, path)| !path.is_empty()) {
+        return Err("credential_origin_mismatch");
+    }
+    let origin = url::Url::parse(origin).map_err(|_| "credential_origin_mismatch")?;
+    if origin.path() != "/"
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+        || !origin.username().is_empty()
+        || origin.password().is_some()
+        || origin.origin().ascii_serialization() != expected
+    {
+        return Err("credential_origin_mismatch");
     }
     Ok(())
 }
@@ -804,7 +821,7 @@ async fn put_notification_credentials(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: Request,
 ) -> Response {
-    if let Err(message) = credential_guard(&app, peer.ip(), req.headers(), req.uri()) {
+    if let Err(message) = credential_guard(&app, peer.ip(), req.headers(), req.uri(), true) {
         return credential_error(StatusCode::FORBIDDEN, message);
     }
     if !single_header(req.headers(), "content-type").ok().flatten().is_some_and(|value| {
@@ -840,7 +857,7 @@ async fn delete_notification_credentials(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: Request,
 ) -> Response {
-    if let Err(message) = credential_guard(&app, peer.ip(), req.headers(), req.uri()) {
+    if let Err(message) = credential_guard(&app, peer.ip(), req.headers(), req.uri(), true) {
         return credential_error(StatusCode::FORBIDDEN, message);
     }
     if axum::body::to_bytes(req.into_body(), 0).await.is_err() {
@@ -1028,6 +1045,55 @@ async fn live(State(app): State<Arc<App>>, ws: WebSocketUpgrade) -> Response {
 mod tests {
     use super::*;
 
+    #[test]
+    fn public_credential_origin_ignores_proxy_headers_and_requires_mutation_origin() {
+        let cfg = Config {
+            auth_dir: "/nonexistent/public-credential-origin-test".into(),
+            management_key: "synthetic-origin-key".into(),
+            notifications: crate::notifications::Config {
+                credential_ui_enabled: true,
+                credential_public_url: "https://dashboard.example.test:443/".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let app = App::new(cfg, std::path::PathBuf::from("/nonexistent/public-credential-config.yaml"));
+        let uri = "/api/notifications/ops/credentials".parse().unwrap();
+        let peer = "192.0.2.1".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer synthetic-origin-key".parse().unwrap());
+        headers.insert("host", "internal-proxy.invalid:8319".parse().unwrap());
+        headers.insert("x-forwarded-proto", "http, https".parse().unwrap());
+        headers.append("x-forwarded-proto", "invalid".parse().unwrap());
+        headers.insert("x-forwarded-host", "untrusted.invalid".parse().unwrap());
+        assert!(credential_guard(&app, peer, &headers, &uri, false).is_ok());
+        assert_eq!(credential_guard(&app, peer, &headers, &uri, true), Err("credential_origin_required"));
+        headers.insert("origin", "https://dashboard.example.test".parse().unwrap());
+        assert!(credential_guard(&app, peer, &headers, &uri, true).is_ok());
+        for origin in [
+            "http://dashboard.example.test",
+            "https://other.example.test",
+            "https://dashboard.example.test/a/..",
+            "https://dashboard.example.test?",
+        ] {
+            headers.insert("origin", origin.parse().unwrap());
+            assert_eq!(credential_guard(&app, peer, &headers, &uri, true), Err("credential_origin_mismatch"));
+            assert_eq!(credential_guard(&app, peer, &headers, &uri, false), Err("credential_origin_mismatch"));
+        }
+        headers.insert("origin", "https://dashboard.example.test".parse().unwrap());
+        headers.insert("sec-fetch-site", "same-site".parse().unwrap());
+        assert_eq!(credential_guard(&app, peer, &headers, &uri, true), Err("credential_cross_site_request_rejected"));
+        headers.remove("sec-fetch-site");
+        let mut cfg = (*app.cfg()).clone();
+        cfg.notifications.credential_public_url = "https://new.example.test".into();
+        app.set_config(cfg);
+        assert_eq!(credential_guard(&app, peer, &headers, &uri, true), Err("credential_origin_mismatch"));
+        headers.insert("origin", "https://new.example.test".parse().unwrap());
+        assert!(credential_guard(&app, peer, &headers, &uri, true).is_ok());
+        headers.remove("authorization");
+        assert_eq!(credential_guard(&app, peer, &headers, &uri, true), Err("credential_authorization_header_required"));
+    }
+
     #[tokio::test]
     async fn key_edits_fall_back_to_a_rewrite_when_formatting_cannot_be_kept() {
         let dir = std::env::temp_dir().join(format!("cliproxyapi-edit-{}", uuid::Uuid::new_v4()));
@@ -1128,14 +1194,14 @@ mod tests {
         headers.insert("authorization", "Bearer synthetic-h2-key".parse().unwrap());
         headers.insert("origin", "https://dashboard.example.test".parse().unwrap());
         let peer = "192.0.2.1".parse().unwrap();
-        assert!(credential_guard(&app, peer, &headers, &uri).is_ok());
+        assert!(credential_guard(&app, peer, &headers, &uri, true).is_ok());
         headers.insert("host", "dashboard.example.test:443".parse().unwrap());
-        assert!(credential_guard(&app, peer, &headers, &uri).is_ok());
+        assert!(credential_guard(&app, peer, &headers, &uri, true).is_ok());
         headers.insert("host", "conflicting.example.test".parse().unwrap());
-        assert_eq!(credential_guard(&app, peer, &headers, &uri), Err("invalid_credential_request_host"));
+        assert_eq!(credential_guard(&app, peer, &headers, &uri, true), Err("invalid_credential_request_host"));
         headers.remove("host");
         let relative = "/api/notifications/ops/credentials".parse().unwrap();
-        assert_eq!(credential_guard(&app, peer, &headers, &relative), Err("invalid_credential_request_host"));
+        assert_eq!(credential_guard(&app, peer, &headers, &relative, true), Err("invalid_credential_request_host"));
     }
     #[test]
     fn bcrypt_management_keys() {

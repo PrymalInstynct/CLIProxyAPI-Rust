@@ -6,7 +6,7 @@ The monitor observes the same quota data used by routing and periodically refres
 
 ## Configure a destination
 
-Set up a webhook in the destination service, then add and save a destination under **Config → Notifications**. Choose **Add credentials** and enter its URL in the write-only **Webhook URL** field; add a token in **Bearer token (optional)** if needed. Credentials are saved separately from YAML.
+Set up a webhook in the destination service, then add and save a destination under **Config → Notifications**. Enable secret entry as described below before choosing **Add credentials**. Enter the URL in the write-only **Webhook URL** field and, if needed, a token in **Bearer token (optional)**. Credentials are saved separately from YAML.
 
 The corresponding configuration is:
 
@@ -16,6 +16,7 @@ notifications:
   time-zone: America/Denver # notification timestamps; IANA time zone
   provider-logos: true # Discord-only provider logo thumbnails; default true
   credential-ui-enabled: false # opt in before entering secrets in the dashboard
+  credential-public-url: https://proxy.example.com # optional HTTPS origin; hot-applied; leave blank for localhost/native TLS
   # Optional. Defaults to <auth-dir>/.notification-secrets.
   secrets-dir: /run/notification-secrets
   # Optional startup-only PEM CA bundle for private HTTPS services.
@@ -36,9 +37,9 @@ notifications:
 
 Destination IDs are unique lowercase names of up to 32 characters using `a-z`, `0-9` and hyphens; do not start or end an ID with a hyphen. You can configure at most eight destinations. Supported formats are `generic`, `discord`, `slack`, `mattermost`, `teams` and `telegram`. Telegram requires a `chat-id`. Keep the ID stable when rotating credentials so queued retries remain associated with the destination.
 
-The dashboard lets you enable or disable notifications and individual destinations, edit destination IDs and formats, set Telegram chat IDs, toggle Discord **Provider logos**, and inspect a safe delivery log. Before entering a secret, open **Secret entry** under **Config → Notifications** and enable **Allow secret entry**. It is off by default. Credential fields remain disabled until this setting is on and the server confirms the request uses an allowed secure connection. Existing managed or external credentials continue to deliver notifications while secret entry is off.
+The dashboard lets you enable or disable notifications and individual destinations, edit destination IDs and formats, set Telegram chat IDs, toggle Discord **Provider logos**, and inspect a safe delivery log. Before entering a secret, open **Secret entry** under **Config → Notifications** and enable **Allow secret entry**. It is off by default, and existing managed or external credentials continue to deliver while it is off. When you enable it over HTTPS, the dashboard fills **Public dashboard URL** with the current origin if it is blank. Confirm that origin and **Save settings**; the setting applies immediately without a restart. You can use **Use current address** to fill it explicitly. The URL must be an HTTPS origin only: scheme and host, with no credentials, path, query, or fragment.
 
-For a remote dashboard behind a trusted HTTPS reverse proxy, open **HTTPS reverse proxy setup** and add only the proxy's exact peer address under **Trusted HTTPS proxy addresses**. The panel shows the observed peer address and offers **Use current proxy address** only for HTTPS requests. Verify that this is the actual proxy connecting to the application before saving trust; the observed address is a hint, not automatic approval. Saving proxy trust requires a restart, shown by the existing configuration banner. Direct localhost access or already-configured native startup TLS needs no proxy trust or restart to enable secret entry. An authenticated secure request is still required in every case.
+The public URL must match the browser's request origin for credential changes. The dashboard also requires HTTPS and same-origin access, and uses the management bearer header when a management key is configured. These checks do not attest that a reverse proxy really terminates TLS. As the deployment administrator, ensure the public endpoint uses valid HTTPS and that the proxy does not expose an insecure route to the dashboard or API. Direct localhost access and native server TLS can use a blank public URL.
 
 After enabling secret entry, first save the destination, then choose **Add credentials** (or **Replace credentials**) and use **Save credentials**. Saving replaces the complete bundle; an empty bearer field clears any previous token. **Remove credentials** requires inline confirmation (**Remove** or **Keep credentials**). After a save request is sent, the password fields clear even if the server rejects it. Values are never returned to the browser, kept in browser storage, written to YAML, or logged. **Send test** makes one delivery attempt and reports its result; it may take up to 20 seconds and is limited to one attempt per destination every 30 seconds. The test previews both bundled provider logos. Status shows safe categories and HTTP status codes. It does not expose webhook URLs, tokens, remote response bodies, or raw network errors. Activity refreshes every five seconds while the section is open and can be filtered by destination.
 
@@ -50,7 +51,7 @@ Notification messages use the current sanitized account display name shown in Ac
 
 Choose an IANA time zone under **Config → Notifications → Notification time zone**, or select **Use browser time zone**. The default is `UTC`. The setting takes effect on save without a restart, and daylight-saving changes follow the selected zone automatically. Chat messages include local timestamps with their time-zone abbreviation and numeric UTC offset. Generic webhook JSON retains the UTC `observed_at` and `resets_at` fields and adds `time_zone`, `observed_at_local`, and `resets_at_local`; local RFC3339 values include the numeric offset, while `time_zone` carries the IANA name. Timestamp values in the journal remain UTC.
 
-The management API exposes the same status and test action. `GET /api/notifications` returns sanitized notification status, including `credential_ui_enabled`, `credential_ui_ready`, and a safe `credential_ui_reason`. It also reports the observed `credential_proxy_peer` and its single-address `credential_proxy_cidr` as setup hints; these values do not imply trust. `POST /api/notifications/{id}/test` makes one delivery attempt and returns its result. Both routes use the normal dashboard management authentication.
+The management API exposes the same status and test action. `GET /api/notifications` returns sanitized notification status, including `credential_ui_enabled`, `credential_ui_ready`, a safe `credential_ui_reason`, and normalized `credential_public_url`. `POST /api/notifications/{id}/test` makes one delivery attempt and returns its result. Both routes use the normal dashboard management authentication.
 
 The test endpoint requires an empty JSON object, which the dashboard sends automatically. For example, from the server host:
 
@@ -77,9 +78,11 @@ The credential API accepts only a valid saved destination ID. `PUT /api/notifica
 
 The browser requires JSON same-origin requests to prevent ordinary cross-origin form submissions from saving or deleting credentials.
 
-Credential writes require an authenticated secure request. The `credential-ui-enabled` setting defaults to false and allows the dashboard form to be used only when the server also confirms the connection is secure. For remote access, use startup TLS or trust the exact HTTPS reverse-proxy peer through the **Secret entry** panel. The proxy must strip client-supplied forwarding headers and set its own `X-Forwarded-Proto: https`; if it uses `X-Forwarded-Host`, that value must match the browser-visible host. Proxy trust is startup-only and takes effect after restart. Never trust all private addresses or a Docker bridge/NAT gateway. Plain HTTP is permitted only for a direct request from a loopback peer to `localhost` or a loopback IP Host, with no forwarding headers.
+Credential writes require secret entry to be enabled, an authenticated request, HTTPS in the browser, and a mandatory `Origin` matching the configured public dashboard origin. The `credential-ui-enabled` setting defaults to false. **Public dashboard URL** is a normalized HTTPS origin, not a webhook URL; the dashboard rejects values containing credentials, a path, query, or fragment. The origin check prevents cross-origin writes but is not proof that TLS is configured correctly at the proxy. The deployment administrator must configure and verify TLS termination and routing. Direct localhost access and native server TLS can leave the URL blank.
 
-Example for a reverse proxy at one fixed address:
+Advanced deployments can still use `notifications.credential-proxy-cidrs` to trust exact reverse-proxy peers for the previous forwarded-protocol setup. This list is optional compatibility configuration, startup-only, and requires a restart after edits. It is not part of the normal **Secret entry** setup. Never trust broad ranges or shared Docker gateway addresses. A direct HTTP request is accepted only from a loopback peer to `localhost` or a loopback IP Host, without forwarding headers.
+
+Example for an advanced reverse-proxy compatibility setup:
 
 ```yaml
 notifications:

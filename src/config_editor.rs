@@ -758,6 +758,8 @@ mod tests {
             notifications["enabled"] = json!(true);
             notifications["time-zone"] = json!("America/Denver");
             notifications["provider-logos"] = json!(false);
+            notifications["credential-ui-enabled"] = json!(true);
+            notifications["credential-public-url"] = json!("https://dashboard.example.test/");
             notifications["destinations"] = json!([{"id":"ops-discord","format":"discord","enabled":true}]);
             let (out, cfg) = edit(&source, json!({"notifications": notifications}));
             assert!(out.contains("# Keep this deployment note"));
@@ -766,6 +768,8 @@ mod tests {
             assert!(cfg.notifications.enabled);
             assert_eq!(cfg.notifications.time_zone, "America/Denver");
             assert!(!cfg.notifications.provider_logos);
+            assert!(cfg.notifications.credential_ui_enabled);
+            assert_eq!(cfg.notifications.credential_public_url, "https://dashboard.example.test/");
             assert_eq!(cfg.notifications.destinations[0].id, "ops-discord");
             assert_eq!(
                 yaml(&out).unwrap()["notifications"]["private-endpoints"],
