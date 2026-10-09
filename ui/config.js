@@ -214,6 +214,7 @@ function configDiagnosticsHTML() {
 const NOTIFICATION_FORMATS = [['generic', 'Generic webhook'], ['discord', 'Discord'], ['slack', 'Slack'],
   ['mattermost', 'Mattermost'], ['teams', 'Microsoft Teams'], ['telegram', 'Telegram']];
 
+/** List supported IANA zones while retaining the configured value. */
 function notificationTimeZones() {
   let zones = ['America/Denver', 'America/New_York', 'America/Chicago', 'America/Los_Angeles', 'Europe/London', 'Asia/Tokyo'];
   try { if (Intl.supportedValuesOf) zones = Intl.supportedValuesOf('timeZone'); } catch {}
@@ -221,6 +222,7 @@ function notificationTimeZones() {
   return ['UTC', ...[...new Set([...zones, current])].filter((zone) => zone !== 'UTC').sort()].map((zone) => [zone, zone]);
 }
 
+/** Render delivery timestamps in the configured notification zone. */
 function notificationLogTime(timestamp) {
   if (!timestamp) return '—';
   const date = new Date(timestamp);
@@ -228,6 +230,7 @@ function notificationLogTime(timestamp) {
   catch { return date.toISOString().replace('T', ' ').replace('.000Z', ' UTC'); }
 }
 
+/** Render sanitized delivery activity newest first and mask account names in privacy mode. */
 function notificationActivityHTML() {
   const n = S.notifications;
   const status = n.status;
@@ -245,6 +248,7 @@ function notificationActivityHTML() {
         <td class="mono">${esc(row.attempt)}</td><td>${esc(row.outcome)}${row.detail ? `<small>${esc(row.detail)}</small>` : ''}${row.http_status ? `<small>HTTP ${esc(row.http_status)}</small>` : ''}</td></tr>`).join('')}</tbody></table></div>` : '<p class="cfg-empty">No delivery attempts to show yet. Save a destination and send a test to check its setup.</p>'}`;
 }
 
+/** Accept only a normalized HTTPS origin without credentials, paths or URL suffixes. */
 function notificationPublicOrigin(value) {
   if (typeof value !== 'string' || !value || value.length > 300 || !/^https:\/\/[^/?#\\\s@]+\/?$/i.test(value)) return null;
   try {
@@ -254,12 +258,14 @@ function notificationPublicOrigin(value) {
   } catch { return null; }
 }
 
+/** Require HTTPS at the confirmed origin or direct localhost before enabling secret entry. */
 function notificationCredentialSecure() {
   const publicURL = S.notifications.status?.credential_public_url;
   if (publicURL) return location.protocol === 'https:' && notificationPublicOrigin(publicURL) === location.origin;
   return location.protocol === 'https:' || ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
 }
 
+/** Explain opt-in secret-entry readiness using safe server status categories. */
 function notificationSecretEntryStatus() {
   const n = S.notifications;
   if (configDirty() || rawDirty()) return 'Save settings to apply changes.';
@@ -271,6 +277,7 @@ function notificationSecretEntryStatus() {
   return 'This connection cannot enter secrets. Check the saved dashboard address and authentication.';
 }
 
+/** Render the secret-entry opt-in and dashboard-origin confirmation within Config. */
 function notificationSecretEntryHTML() {
   return `<section aria-label="Secret entry"><h3>Secret entry</h3>
     ${configSwitch(['notifications', 'credential-ui-enabled'], 'Allow secret entry', 'Enable adding, replacing and removing credentials in this dashboard. Saved credentials continue working when this is off.')}
@@ -280,6 +287,7 @@ function notificationSecretEntryHTML() {
     <p class="cfg-description">This setting relies on your deployment providing HTTPS at the confirmed address.</p></section>`;
 }
 
+/** Render write-only credential controls and protect externally managed or unsaved destinations. */
 function notificationCredentialControls(d, saved, index) {
   const n = S.notifications;
   const dirty = configDirty() || rawDirty();
@@ -308,6 +316,7 @@ function notificationCredentialControls(d, saved, index) {
       ${saved.credential_configured ? `<button type="button" class="btn small ghost danger" data-config-act="remove-notification-credentials" data-destination="${esc(d.id)}" ${disabled ? 'disabled' : ''}>Remove credentials</button>` : ''}</div>${note}`;
 }
 
+/** Submit a same-origin credential mutation without retaining values in application state. */
 async function mutateNotificationCredentials(id, method, body) {
   const headers = { 'Content-Type': 'application/json' };
   if (S.key) headers.Authorization = `Bearer ${S.key}`;
@@ -337,6 +346,7 @@ async function mutateNotificationCredentials(id, method, body) {
   }
 }
 
+/** Read password fields only for submission and clear them even when the server rejects the save. */
 async function saveNotificationCredentials(id) {
   const n = S.notifications;
   if (n.busy || configDirty() || rawDirty() || !n.status?.credential_ui_ready || !notificationCredentialSecure()) return;
@@ -366,6 +376,7 @@ async function saveNotificationCredentials(id) {
   if (S.route === 'config' && S.config.section === 'notifications') render();
 }
 
+/** Require inline confirmation before removing a managed credential bundle. */
 async function removeNotificationCredentials(id) {
   const n = S.notifications;
   if (n.busy || configDirty() || rawDirty() || !n.status?.credential_ui_ready || !notificationCredentialSecure()) return;
@@ -379,6 +390,7 @@ async function removeNotificationCredentials(id) {
   if (S.route === 'config' && S.config.section === 'notifications') render();
 }
 
+/** Render notification settings using the existing Config grid and control styles. */
 function configNotificationsHTML() {
   const list = configGet(['notifications', 'destinations']) || [];
   const n = S.notifications;
@@ -414,6 +426,7 @@ function configNotificationsHTML() {
     <div class="cfg-divider"></div><div id="notification-activity">${notificationActivityHTML()}</div>`;
 }
 
+/** Refresh sanitized status while preserving the active settings draft. */
 async function loadNotifications() {
   const n = S.notifications;
   if (n.loading || S.locked) return;
@@ -430,6 +443,7 @@ async function loadNotifications() {
   }
 }
 
+/** Update the activity table without replacing credential inputs or form drafts. */
 function patchNotificationActivity() {
   const focus = document.activeElement?.id;
   const scroll = document.querySelector('.notification-log')?.scrollTop || 0;
@@ -439,6 +453,7 @@ function patchNotificationActivity() {
   if (focus === 'notification-log-filter') document.getElementById(focus)?.focus({ preventScroll: true });
 }
 
+/** Disable credential and destination mutations until their saved configuration is safe to edit. */
 function updateNotificationActions() {
   const n = S.notifications;
   const dirty = configDirty() || rawDirty();
@@ -472,6 +487,7 @@ function updateNotificationActions() {
   }
 }
 
+/** Request one test delivery and display only the sanitized result. */
 async function testNotification(id) {
   const n = S.notifications;
   if (n.busy || configDirty() || rawDirty()) return;

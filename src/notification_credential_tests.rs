@@ -10,6 +10,7 @@ const KEY: &str = "notification-credential-management-key";
 struct Temp(PathBuf);
 
 impl Temp {
+    /// Create an isolated temporary test directory without using production credentials.
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!("notification-credential-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&path).unwrap();
@@ -18,11 +19,13 @@ impl Temp {
 }
 
 impl Drop for Temp {
+    /// Release the test task or remove its temporary files when the fixture leaves scope.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
+/// Construct a synthetic management fixture with an isolated auth directory and config file.
 fn app(temp: &Temp, secrets_dir: Option<&Path>) -> Arc<crate::state::App> {
     let mut cfg = crate::config::Config {
         auth_dir: temp.0.join("auth").to_string_lossy().into_owned(),
@@ -47,11 +50,13 @@ fn app(temp: &Temp, secrets_dir: Option<&Path>) -> Arc<crate::state::App> {
 struct TestServer(tokio::task::JoinHandle<()>);
 
 impl Drop for TestServer {
+    /// Release the test task or remove its temporary files when the fixture leaves scope.
     fn drop(&mut self) {
         self.0.abort();
     }
 }
 
+/// Run the synthetic management router on an ephemeral loopback port.
 async fn serve(app: Arc<crate::state::App>) -> (String, TestServer) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -62,10 +67,12 @@ async fn serve(app: Arc<crate::state::App>) -> (String, TestServer) {
     (origin, TestServer(task))
 }
 
+/// Build the management route for a synthetic destination.
 fn credential_route(origin: &str, id: &str) -> String {
     format!("{origin}/api/notifications/{id}/credentials")
 }
 
+/// Attach synthetic management authentication and same-origin headers to a test request.
 fn authenticated(
     client: &reqwest::Client,
     method: reqwest::Method,
@@ -79,6 +86,7 @@ fn authenticated(
         .header("sec-fetch-site", "same-origin")
 }
 
+/// Provision a synthetic external secret with private permissions on Unix.
 fn private_file(path: &Path, text: &str) {
     std::fs::write(path, text).unwrap();
     #[cfg(unix)]
@@ -89,6 +97,7 @@ fn private_file(path: &Path, text: &str) {
 }
 
 #[cfg(unix)]
+/// Verify that a managed test bundle is readable only by its Unix owner.
 fn assert_private_file(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
@@ -96,6 +105,7 @@ fn assert_private_file(path: &Path) {
 }
 
 #[cfg(unix)]
+/// Verify that a managed test directory excludes group and other Unix access.
 fn assert_private_directory(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
@@ -103,6 +113,7 @@ fn assert_private_directory(path: &Path) {
 }
 
 #[tokio::test]
+/// Verify that managed credentials save replace clear reload and delete without leaking secrets.
 async fn managed_credentials_save_replace_clear_reload_and_delete_without_leaking_secrets() {
     let temp = Temp::new();
     let app = app(&temp, None);
@@ -189,6 +200,7 @@ async fn managed_credentials_save_replace_clear_reload_and_delete_without_leakin
     assert!(!credential_path.exists());
 }
 
+/// Submit a synthetic raw YAML edit through the authenticated management API.
 async fn put_raw_config(client: &reqwest::Client, origin: &str, cfg: &crate::config::Config) -> reqwest::Response {
     let text = serde_yaml::to_string(cfg).unwrap();
     authenticated(client, reqwest::Method::PUT, &format!("{origin}/api/config"), origin)
@@ -198,6 +210,7 @@ async fn put_raw_config(client: &reqwest::Client, origin: &str, cfg: &crate::con
         .unwrap()
 }
 
+/// Submit a synthetic destination edit through the structured settings API.
 async fn patch_destinations(client: &reqwest::Client, origin: &str, destinations: Value) -> reqwest::Response {
     let settings: Value = client
         .get(format!("{origin}/api/config/settings"))
@@ -219,6 +232,7 @@ async fn patch_destinations(client: &reqwest::Client, origin: &str, destinations
 }
 
 #[tokio::test]
+/// Verify that saved credentials block raw config delete and rename until removed.
 async fn saved_credentials_block_raw_config_delete_and_rename_until_removed() {
     let temp = Temp::new();
     let current_app = app(&temp, None);
@@ -273,6 +287,7 @@ async fn saved_credentials_block_raw_config_delete_and_rename_until_removed() {
 }
 
 #[tokio::test]
+/// Verify that managed credentials block structured destination changes but removal unblocks patch.
 async fn managed_credentials_block_structured_destination_changes_but_removal_unblocks_patch() {
     let temp = Temp::new();
     let current_app = app(&temp, None);
@@ -306,6 +321,7 @@ async fn managed_credentials_block_structured_destination_changes_but_removal_un
 }
 
 #[tokio::test]
+/// Verify that orphaned managed credentials block id reuse until deleted but external only does not.
 async fn orphaned_managed_credentials_block_id_reuse_until_deleted_but_external_only_does_not() {
     let temp = Temp::new();
     let current_app = app(&temp, None);
@@ -361,6 +377,7 @@ async fn orphaned_managed_credentials_block_id_reuse_until_deleted_but_external_
 }
 
 #[tokio::test]
+/// Verify that managed credential api requires bearer auth and rejects origin and forwarded header spoofing.
 async fn managed_credential_api_requires_bearer_auth_and_rejects_origin_and_forwarded_header_spoofing() {
     let temp = Temp::new();
     let app = app(&temp, None);
@@ -412,6 +429,7 @@ async fn managed_credential_api_requires_bearer_auth_and_rejects_origin_and_forw
 }
 
 #[tokio::test]
+/// Verify that loopback http accepts a localhost host without forwarded headers.
 async fn loopback_http_accepts_a_localhost_host_without_forwarded_headers() {
     let temp = Temp::new();
     let app = app(&temp, None);
@@ -433,6 +451,7 @@ async fn loopback_http_accepts_a_localhost_host_without_forwarded_headers() {
 }
 
 #[tokio::test]
+/// Verify that credential ui is opt in hot reloadable and disabling it preserves saved secret.
 async fn credential_ui_is_opt_in_hot_reloadable_and_disabling_it_preserves_saved_secret() {
     assert!(!crate::notifications::Config::default().credential_ui_enabled);
     let temp = Temp::new();
@@ -488,6 +507,7 @@ async fn credential_ui_is_opt_in_hot_reloadable_and_disabling_it_preserves_saved
 }
 
 #[tokio::test]
+/// Verify that only startup trusted proxy cidrs can assert a single https forwarded proto.
 async fn only_startup_trusted_proxy_cidrs_can_assert_a_single_https_forwarded_proto() {
     let temp = Temp::new();
     let app = app(&temp, None);
@@ -547,6 +567,7 @@ async fn only_startup_trusted_proxy_cidrs_can_assert_a_single_https_forwarded_pr
 }
 
 #[tokio::test]
+/// Verify that configured public origin is exact hot reloadable and revocable without losing secret.
 async fn configured_public_origin_is_exact_hot_reloadable_and_revocable_without_losing_secret() {
     let temp = Temp::new();
     let app = app(&temp, None);
@@ -660,6 +681,7 @@ async fn configured_public_origin_is_exact_hot_reloadable_and_revocable_without_
 }
 
 #[tokio::test]
+/// Verify that invalid managed credential inputs fail without echo or partial write.
 async fn invalid_managed_credential_inputs_fail_without_echo_or_partial_write() {
     let temp = Temp::new();
     let app = app(&temp, None);
@@ -716,6 +738,7 @@ async fn invalid_managed_credential_inputs_fail_without_echo_or_partial_write() 
 
 #[cfg(unix)]
 #[tokio::test]
+/// Verify that managed credential replacement rejects symlink and hardlink targets.
 async fn managed_credential_replacement_rejects_symlink_and_hardlink_targets() {
     use std::os::unix::fs::symlink;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -757,6 +780,7 @@ async fn managed_credential_replacement_rejects_symlink_and_hardlink_targets() {
 }
 
 #[tokio::test]
+/// Verify that invalid external credentials remain authoritative and cannot be replaced by managed values.
 async fn invalid_external_credentials_remain_authoritative_and_cannot_be_replaced_by_managed_values() {
     let temp = Temp::new();
     let app = app(&temp, None);
@@ -817,6 +841,7 @@ async fn invalid_external_credentials_remain_authoritative_and_cannot_be_replace
 }
 
 #[tokio::test]
+/// Verify that managed credentials use unified resolver and block loopback before outbound send.
 async fn managed_credentials_use_unified_resolver_and_block_loopback_before_outbound_send() {
     let temp = Temp::new();
     let app = app(&temp, None);

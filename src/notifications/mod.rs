@@ -24,9 +24,11 @@ use std::{
 };
 use store::{Log, MAX_PENDING, Pending, Store};
 
+/// Default destination delivery and bundled provider thumbnails to enabled.
 fn yes() -> bool {
     true
 }
+/// Default explicit private endpoint permissions to the HTTPS port.
 fn https_port() -> u16 {
     443
 }
@@ -45,6 +47,7 @@ pub struct Config {
     pub destinations: Vec<Destination>,
 }
 impl Default for Config {
+    /// Keep monitoring and secret entry opt-in, with UTC timestamps and bundled thumbnails.
     fn default() -> Self {
         Self {
             enabled: false,
@@ -88,6 +91,7 @@ pub enum Format {
     Teams,
     Telegram,
 }
+/// Accept only bounded lowercase destination IDs safe for filenames and environment bindings.
 pub fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 32
@@ -96,6 +100,7 @@ pub fn valid_id(id: &str) -> bool {
         && id.as_bytes()[id.len() - 1] != b'-'
 }
 impl Config {
+    /// Validate configuration bounds and reject invalid time zones, origins, destinations, or network rules.
     pub fn validate(&self) -> Result<(), String> {
         credential_public_origin(&self.credential_public_url).map_err(|_|"notifications: credential-public-url must be an HTTPS origin without credentials, query, fragment or path".to_string())?;
         if self.credential_proxy_cidrs.len() > 16 {
@@ -222,6 +227,7 @@ pub struct Service {
     credentials_write: Mutex<()>,
 }
 impl Service {
+    /// Capture startup-only secret paths and network permissions without creating monitoring state.
     pub fn new(cfg: &AppConfig) -> Self {
         let root = cfg.auth_dir();
         let secrets = cfg
@@ -240,6 +246,7 @@ impl Service {
             credentials_write: Mutex::new(()),
         }
     }
+    /// Initialize the exclusively locked journal on demand and retain a safe startup error on failure.
     fn open(&self) -> Result<(), &'static str> {
         let mut inner = self.inner.lock();
         if inner.store.is_none() {
@@ -256,6 +263,7 @@ impl Service {
         }
         Ok(())
     }
+    /// Expose credential readiness and sanitized delivery activity without reading secrets into responses.
     pub fn status(&self, app: &App) -> Value {
         let cfg = app.cfg();
         let (active, error, warning, pending, installation, stored_logs) = {
@@ -303,6 +311,7 @@ impl Service {
         });
         json!({"enabled":cfg.notifications.enabled,"time_zone":cfg.notifications.time_zone,"credential_ui_enabled":cfg.notifications.credential_ui_enabled,"credential_public_url":credential_public_origin(&cfg.notifications.credential_public_url).ok().flatten().unwrap_or_default(),"active":active,"error":error,"warning":warning,"pending":pending,"destinations":destinations,"logs":logs,"capabilities":{"supported":supported,"unsupported":unsupported},"private_endpoints_restart_required":true})
     }
+    /// Rate-limit a single test delivery and journal only its credential-free result.
     pub async fn test(&self, app: &App, id: &str) -> Result<Value, &'static str> {
         let cfg = app.cfg();
         if !cfg.notifications.enabled {
@@ -357,6 +366,7 @@ impl Service {
         }
         if outcome.success { Ok(json!({"delivered":true,"http_status":outcome.status})) } else { Err(outcome.reason) }
     }
+    /// Match the request peer only against the startup-configured proxy CIDRs.
     pub fn trusted_credential_proxy(&self, peer: std::net::IpAddr) -> bool {
         let original_peer = peer;
         let peer = match peer {
@@ -369,6 +379,7 @@ impl Service {
                 || delivery::cidr_contains(cidr, original_peer)
         })
     }
+    /// Serialize credential changes with config edits and refuse externally managed destinations.
     pub fn save_credentials(
         &self,
         app: &App,
@@ -400,6 +411,7 @@ impl Service {
         app.broadcast("notifications", Value::Null);
         Ok(())
     }
+    /// Remove managed bundles, including orphaned IDs, without deleting external secret bindings.
     pub fn remove_credentials(&self, app: &App, id: &str) -> Result<(), &'static str> {
         let _config_guard = app.config_write.lock();
         let _guard = self.credentials_write.lock();
@@ -438,6 +450,7 @@ impl Service {
         }
         Ok(())
     }
+    /// Request authoritative usage after an exhausted window reaches its estimated reset time.
     pub fn reset_due(&self, acct: &Account, now: chrono::DateTime<Utc>) -> bool {
         let inner = self.inner.lock();
         let Some(store) = &inner.store else {
@@ -451,10 +464,12 @@ impl Service {
         })
     }
 }
+/// Restrict monitoring to Claude/Codex OAuth subscriptions using native provider endpoints.
 fn native(acct: &Account) -> bool {
     matches!(acct.provider, Provider::Claude | Provider::Codex)
         && matches!(&*acct.cred.read(),Credential::OAuth(o) if o.base_url.is_none())
 }
+/// Hash provider identity with an installation-local salt rather than persisting account identifiers.
 fn identity(acct: &Account, salt: &str) -> String {
     let cred = acct.cred.read();
     let provider = acct.provider.as_str();
@@ -469,9 +484,11 @@ fn identity(acct: &Account, salt: &str) -> String {
     }
     hex::encode(hash.finalize())[..24].into()
 }
+/// Resolve the validated display zone, falling back to UTC for legacy configuration.
 fn time_zone(config: &Config) -> chrono_tz::Tz {
     config.time_zone.parse().unwrap_or(chrono_tz::UTC)
 }
+/// Resolve the current account label at send time without storing identifying presentation data.
 fn display_name(app: &App, id: &str, salt: &str) -> Option<String> {
     app.pool
         .all()
@@ -479,6 +496,7 @@ fn display_name(app: &App, id: &str, salt: &str) -> Option<String> {
         .find(|account| native(account) && identity(account, salt) == id)
         .map(|account| delivery::safe_name(&account.label))
 }
+/// Build one bounded delivery record using fixed outcome categories and credential-free event fields.
 fn log(destination: &str, event: &Event, attempt: u8, outcome: &delivery::Outcome, retrying: bool) -> Log {
     Log {
         timestamp: Utc::now(),
@@ -506,9 +524,11 @@ struct FreshEvidence {
     authoritative: BTreeSet<String>,
     exhausted: BTreeSet<String>,
 }
+/// Keep shared and model-scoped quota windows distinct in confirmation evidence.
 fn window_key(name: &str, model: Option<&str>) -> String {
     format!("{}:{}", name, model.unwrap_or("*"))
 }
+/// Collect the scopes still exhausted when a recovery event is considered.
 fn blockers(subscription: &Subscription) -> Vec<String> {
     subscription
         .windows
@@ -524,6 +544,7 @@ fn blockers(subscription: &Subscription) -> Vec<String> {
         .collect()
 }
 impl FreshEvidence {
+    /// Track fresh coverage and exhaustion, requiring full applicable coverage to confirm unknown scopes.
     fn record(&mut self, subscription: &Subscription, observation: &state::Observation) {
         for window in observation.windows.iter().filter(|w| state::valid_window(w)) {
             let key = window_key(&window.name, window.model.as_deref());
@@ -564,9 +585,11 @@ impl FreshEvidence {
             }
         }
     }
+    /// Require authoritative confirmation for every learned window before releasing resumed recovery.
     fn complete(&self, subscription: &Subscription) -> bool {
         !subscription.windows.is_empty() && subscription.windows.keys().all(|key| self.authoritative.contains(key))
     }
+    /// Gate dispatch on fresh matching exhaustion or authoritative recovery coverage.
     fn permits(&self, event: &Event, subscription: &Subscription, resumed: bool) -> bool {
         let key = window_key(&event.window, event.model.as_deref());
         match event.event.as_str() {
@@ -577,6 +600,7 @@ impl FreshEvidence {
         }
     }
 }
+/// Persist bounded transitions before dispatch, cancel superseded events, and retry four sends concurrently.
 pub async fn worker(app: Arc<App>) {
     let mut seen: BTreeMap<String, u64> = BTreeMap::new();
     let mut fresh: BTreeMap<String, FreshEvidence> = BTreeMap::new();
@@ -931,6 +955,7 @@ pub async fn worker(app: Arc<App>) {
 mod tests {
     use super::*;
     #[test]
+    /// Verify that credential public url is a strict normalized https origin.
     fn credential_public_url_is_a_strict_normalized_https_origin() {
         assert_eq!(credential_public_origin(""), Ok(None));
         assert_eq!(
@@ -966,6 +991,7 @@ mod tests {
     }
     struct Temp(PathBuf);
     impl Temp {
+        /// Create an isolated temporary test directory without using production credentials.
         fn new() -> Self {
             let dir = std::env::temp_dir().join(format!("notifications-test-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&dir).unwrap();
@@ -973,10 +999,12 @@ mod tests {
         }
     }
     impl Drop for Temp {
+        /// Release the test task or remove its temporary files when the fixture leaves scope.
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+    /// Create synthetic subscription state and an isolated journal for notification worker tests.
     fn fixture(enabled: bool) -> (Temp, Arc<App>, Arc<Account>) {
         let temp = Temp::new();
         std::fs::write(temp.0.join("account.json"),json!({"type":"claude","account_id":"private-provider-account","email":"private-email-sentinel@example.test","access_token":"private-oauth-sentinel","expired":"2099-01-01T00:00:00Z"}).to_string()).unwrap();
@@ -998,6 +1026,7 @@ mod tests {
         let acct = app.pool.all()[0].clone();
         (temp, app, acct)
     }
+    /// Bound the wait for asynchronous worker delivery records in a test.
     async fn until_logs(app: &App, count: usize) {
         tokio::time::timeout(Duration::from_secs(6), async {
             loop {
@@ -1011,6 +1040,7 @@ mod tests {
         .unwrap();
     }
     #[test]
+    /// Verify that destination validation prevents credential namespace escape.
     fn destination_validation_prevents_credential_namespace_escape() {
         for id in ["", "../secret", "A", "foo_bar", "-foo", "foo-", "é"] {
             assert!(!valid_id(id));
@@ -1030,6 +1060,7 @@ mod tests {
         assert!(bad.validate().is_err());
     }
     #[test]
+    /// Verify that old config and legacy journal remain loadable without persisting presentation.
     fn old_config_and_legacy_journal_remain_loadable_without_persisting_presentation() {
         let old: Config = serde_json::from_value(json!({"enabled":true,"destinations":[]})).unwrap();
         assert_eq!(old.time_zone, "UTC");
@@ -1053,6 +1084,7 @@ mod tests {
         assert!(!persisted.contains("display_name"));
     }
     #[test]
+    /// Verify that network and secret policy remain startup only after management config reload.
     fn network_and_secret_policy_remain_startup_only_after_management_config_reload() {
         let (_temp, app, _) = fixture(false);
         let mut cfg = (*app.cfg()).clone();
@@ -1066,6 +1098,7 @@ mod tests {
         assert!(app.notifications.secrets.ends_with(".notification-secrets"));
     }
     #[tokio::test]
+    /// Verify that accepted first tick headers are sent and evidence overflow recovers.
     async fn accepted_first_tick_headers_are_sent_and_evidence_overflow_recovers() {
         let (_temp, app, acct) = fixture(true);
         let headers = reqwest::header::HeaderMap::from_iter([(
@@ -1103,6 +1136,7 @@ mod tests {
         let _ = task.await;
     }
     #[tokio::test]
+    /// Verify that feature off does not capture observations or create notification state.
     async fn feature_off_does_not_capture_observations_or_create_notification_state() {
         let (temp, app, acct) = fixture(false);
         let headers = reqwest::header::HeaderMap::from_iter([(
@@ -1117,9 +1151,11 @@ mod tests {
         task.abort();
         let _ = task.await;
     }
+    /// Create a shared-window quota sample for recovery confirmation tests.
     fn sample(name: &str, used: f64) -> crate::quota::Window {
         crate::quota::Window { name: name.into(), used, resets_at: None, model: None }
     }
+    /// Persist a synthetic event before starting a worker to exercise restart recovery rules.
     fn seed_pending(app: &App, acct: &Account, kind: &str) -> String {
         app.notifications.open().unwrap();
         let mut inner = app.notifications.inner.lock();
@@ -1161,6 +1197,7 @@ mod tests {
         store.save().unwrap();
         id
     }
+    /// Wait until the worker consumes synthetic evidence without contacting a real provider.
     async fn consumed(app: &App, acct: &Account) {
         tokio::time::timeout(Duration::from_secs(6), async {
             while !acct.state.lock().notification_evidence.observations.is_empty() {
@@ -1173,12 +1210,14 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(app.notifications.status(app)["error"].is_null());
     }
+    /// Assert that unconfirmed persisted recovery remains queued without a delivery attempt.
     fn assert_waiting(app: &App) {
         let status = app.notifications.status(app);
         assert_eq!(status["pending"], 1);
         assert!(status["logs"].as_array().unwrap().is_empty());
     }
     #[tokio::test]
+    /// Verify that persisted available after restart waits for all fresh authoritative windows.
     async fn persisted_available_after_restart_waits_for_all_fresh_authoritative_windows() {
         let (temp, app, acct) = fixture(true);
         seed_pending(&app, &acct, "quota.available");
@@ -1206,6 +1245,7 @@ mod tests {
         let _ = task.await;
     }
     #[tokio::test]
+    /// Verify that reenabled pending recovery discards pre pause confirmation.
     async fn reenabled_pending_recovery_discards_pre_pause_confirmation() {
         let (_temp, app, acct) = fixture(true);
         seed_pending(&app, &acct, "quota.available");
@@ -1231,6 +1271,7 @@ mod tests {
         let _ = task.await;
     }
     #[tokio::test]
+    /// Verify that brief account or global pause requires new confirmation even between worker ticks.
     async fn brief_account_or_global_pause_requires_new_confirmation_even_between_worker_ticks() {
         for account_pause in [false, true] {
             let (_temp, app, acct) = fixture(true);
@@ -1275,6 +1316,7 @@ mod tests {
         }
     }
     #[tokio::test]
+    /// Verify that persisted partial recovery waits but current partial recovery dispatches.
     async fn persisted_partial_recovery_waits_but_current_partial_recovery_dispatches() {
         let (_temp, app, acct) = fixture(true);
         seed_pending(&app, &acct, "quota.window_recovered");
@@ -1317,6 +1359,7 @@ mod tests {
         let _ = task.await;
     }
     #[tokio::test]
+    /// Verify that persisted exhaustion requires fresh matching blocking window.
     async fn persisted_exhaustion_requires_fresh_matching_blocking_window() {
         let (_temp, app, acct) = fixture(true);
         seed_pending(&app, &acct, "quota.exhausted");
@@ -1331,6 +1374,7 @@ mod tests {
         let _ = task.await;
     }
     #[test]
+    /// Verify that unknown recovery confirmation covers shared and learned model windows.
     fn unknown_recovery_confirmation_covers_shared_and_learned_model_windows() {
         let mut subscription = Subscription { provider: "claude".into(), ..Default::default() };
         let mut observation = state::Observation {
@@ -1359,6 +1403,7 @@ mod tests {
         assert!(fresh.permits(&event, &subscription, true));
     }
     #[tokio::test]
+    /// Verify that resumed partial recovery with changed blockers is cancelled.
     async fn resumed_partial_recovery_with_changed_blockers_is_cancelled() {
         let (_temp, app, acct) = fixture(true);
         seed_pending(&app, &acct, "quota.window_recovered");

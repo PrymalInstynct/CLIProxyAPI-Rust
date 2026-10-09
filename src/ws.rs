@@ -415,6 +415,7 @@ async fn connect(acct: &Arc<Account>, client_headers: &HeaderMap) -> Result<Upst
     Ok(ws)
 }
 
+/// Relay one native turn while binding streamed quota and rejection evidence to its request epoch.
 async fn native_turn(
     app: &Arc<App>,
     headers: &HeaderMap,

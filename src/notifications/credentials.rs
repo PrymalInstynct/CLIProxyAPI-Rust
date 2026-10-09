@@ -15,18 +15,21 @@ pub struct Bundle {
     pub bearer_token: Option<String>,
 }
 // No Debug implementation: URL and bearer are credentials.
+/// Build a fixed managed-bundle path only after validating the destination ID.
 fn path(root: &Path, id: &str) -> Result<PathBuf, &'static str> {
     if !valid_id(id) {
         return Err("invalid_destination");
     }
     Ok(root.join(".notification-credentials").join(format!("{id}.json")))
 }
+/// Treat unreadable bundle paths as occupied so credential IDs cannot be silently reused.
 pub fn present(root: &Path, id: &str) -> bool {
     path(root, id).is_ok_and(|path| match fs::symlink_metadata(path) {
         Ok(_) => true,
         Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     })
 }
+/// Require a bounded regular file or directory with private Unix ownership and permissions.
 fn private(metadata: &fs::Metadata, directory: bool) -> Result<(), &'static str> {
     if metadata.file_type().is_symlink()
         || if directory { !metadata.is_dir() } else { !metadata.is_file() || metadata.len() > MAX_BUNDLE as u64 }
@@ -46,10 +49,15 @@ fn private(metadata: &fs::Metadata, directory: bool) -> Result<(), &'static str>
     }
     Ok(())
 }
+/// Reject symlinked auth paths and create the private bundle directory when requested.
 fn directory(root: &Path, create: bool) -> Result<PathBuf, &'static str> {
     let mut component = PathBuf::new();
     for part in root.components() {
         component.push(part);
+        // A Windows drive/UNC prefix is not a filesystem entry until its root is appended.
+        if matches!(part, std::path::Component::Prefix(_)) {
+            continue;
+        }
         let metadata = fs::symlink_metadata(&component).map_err(|_| "credential_unavailable")?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err("insecure_credential_directory");
@@ -85,6 +93,7 @@ fn directory(root: &Path, create: bool) -> Result<PathBuf, &'static str> {
     }
     Ok(dir)
 }
+/// Read one bounded Unix bundle, checking ownership and file identity before using its contents.
 pub fn read(root: &Path, id: &str) -> Result<Bundle, &'static str> {
     if !cfg!(unix) {
         return Err("credential_unavailable");
@@ -110,6 +119,7 @@ pub fn read(root: &Path, id: &str) -> Result<Bundle, &'static str> {
     }
     serde_json::from_slice(&bytes).map_err(|_| "invalid_credential")
 }
+/// Persist directory-entry changes on Unix after a bundle is replaced or removed.
 fn sync(dir: &Path) -> Result<(), &'static str> {
     #[cfg(unix)]
     File::open(dir).and_then(|file| file.sync_all()).map_err(|_| "credential_unavailable")?;
@@ -117,6 +127,7 @@ fn sync(dir: &Path) -> Result<(), &'static str> {
     let _ = dir;
     Ok(())
 }
+/// Atomically persist a complete URL/token bundle; refuse writes without Unix permission protection.
 pub fn save(root: &Path, id: &str, bundle: &Bundle) -> Result<(), &'static str> {
     // Managed writes fail closed where this implementation cannot enforce private ACLs.
     if !cfg!(unix) {
@@ -154,6 +165,7 @@ pub fn save(root: &Path, id: &str, bundle: &Bundle) -> Result<(), &'static str> 
     }
     result
 }
+/// Delete only a validated private bundle; an already absent bundle is a successful removal.
 pub fn remove(root: &Path, id: &str) -> Result<(), &'static str> {
     if !cfg!(unix) {
         return Err("managed_credentials_unsupported_platform");

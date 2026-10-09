@@ -40,6 +40,7 @@ pub struct Journal {
     pub logs: VecDeque<Log>,
 }
 impl Default for Journal {
+    /// Create an empty credential-free journal with a fresh installation-local identity salt.
     fn default() -> Self {
         Self {
             installation: uuid::Uuid::new_v4().to_string(),
@@ -54,6 +55,7 @@ pub struct Store {
     path: PathBuf,
     pub journal: Journal,
 }
+/// Open a bounded regular secret file and verify Unix ownership, permissions, and file identity.
 pub fn safe_file(path: &Path) -> Result<File, &'static str> {
     let before = fs::symlink_metadata(path).map_err(|_| "credential_unavailable")?;
     if !before.is_file() || before.file_type().is_symlink() || before.len() > 8192 {
@@ -92,6 +94,7 @@ pub fn safe_file(path: &Path) -> Result<File, &'static str> {
     }
     Ok(file)
 }
+/// Create read/write state files with private Unix permissions.
 fn options() -> OpenOptions {
     let mut opts = OpenOptions::new();
     opts.read(true).write(true).create(true);
@@ -102,6 +105,7 @@ fn options() -> OpenOptions {
     }
     opts
 }
+/// Reject symlinked or incorrectly permissioned state paths before opening them.
 fn private(path: &Path, dir: bool) -> Result<(), &'static str> {
     let meta = fs::symlink_metadata(path).map_err(|_| "state_unavailable")?;
     if meta.file_type().is_symlink() || (dir && !meta.is_dir()) || (!dir && !meta.is_file()) {
@@ -119,6 +123,7 @@ fn private(path: &Path, dir: bool) -> Result<(), &'static str> {
     Ok(())
 }
 impl Store {
+    /// Lock one auth directory exclusively, validate its journal, and persist initialization before use.
     pub fn open(root: &Path) -> Result<Self, &'static str> {
         let dir = root.join(".quota-notifications");
         if !dir.exists() {
@@ -153,6 +158,7 @@ impl Store {
         store.save()?;
         Ok(store)
     }
+    /// Atomically replace and sync the bounded journal before its deliveries can be dispatched.
     pub fn save(&self) -> Result<(), &'static str> {
         let dir = self.path.parent().ok_or("state_unavailable")?;
         let tmp = dir.join(format!("{}.tmp", uuid::Uuid::new_v4()));
@@ -176,6 +182,7 @@ impl Store {
         }
         result
     }
+    /// Retain only the latest 200 sanitized delivery records.
     pub fn log(&mut self, log: Log) {
         self.journal.logs.push_back(log);
         while self.journal.logs.len() > 200 {
@@ -183,6 +190,7 @@ impl Store {
         }
     }
 }
+/// Reject oversized journals and unexpected identifiers, event types, windows, or diagnostic fields.
 fn validate(j: &Journal) -> Result<(), &'static str> {
     let opaque = |s: &str| s.len() == 24 && s.bytes().all(|b| b.is_ascii_hexdigit());
     let window = |s: &str| {
@@ -279,6 +287,7 @@ fn validate(j: &Journal) -> Result<(), &'static str> {
     Ok(())
 }
 #[cfg(windows)]
+/// Use a write-through Windows replacement so existing journals can be updated atomically.
 fn replace_windows(from: &Path, to: &Path) -> Result<(), &'static str> {
     use std::os::windows::ffi::OsStrExt;
     #[link(name = "kernel32")]
@@ -295,6 +304,7 @@ mod tests {
     use super::*;
     struct Temp(PathBuf);
     impl Temp {
+        /// Create an isolated temporary test directory without using production credentials.
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!("notifications-store-{}", uuid::Uuid::new_v4()));
             fs::create_dir(&path).unwrap();
@@ -302,11 +312,13 @@ mod tests {
         }
     }
     impl Drop for Temp {
+        /// Release the test task or remove its temporary files when the fixture leaves scope.
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
     #[test]
+    /// Verify that durable state deduplicates restart and exclusive owner blocks a second monitor.
     fn durable_state_deduplicates_restart_and_exclusive_owner_blocks_a_second_monitor() {
         let temp = Temp::new();
         let mut store = Store::open(&temp.0).unwrap();
@@ -338,6 +350,7 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
+    /// Verify that credentials require private regular bounded files and reject symlinks.
     fn credentials_require_private_regular_bounded_files_and_reject_symlinks() {
         use std::os::unix::fs::{PermissionsExt, symlink};
         let temp = Temp::new();

@@ -278,6 +278,7 @@ pub fn parse_pasted(input: &str) -> (String, Option<String>) {
 
 // ---------------------------------------------------------------------- router
 
+/// Apply the existing management access policy to dashboard and notification routes.
 pub fn router(app: Arc<App>) -> Router<Arc<App>> {
     Router::new()
         .route("/overview", get(overview))
@@ -306,6 +307,7 @@ pub fn router(app: Arc<App>) -> Router<Arc<App>> {
         .layer(middleware::from_fn_with_state(app, auth))
         .layer(middleware::from_fn(notification_no_store))
 }
+/// Prevent intermediaries and browsers from caching notification management responses.
 async fn notification_no_store(req: Request, next: Next) -> Response {
     let sensitive = req.uri().path().ends_with("/credentials") || req.uri().path() == "/notifications";
     let response = next.run(req).await;
@@ -637,6 +639,7 @@ fn keep_original(app: &App, text: &str) {
     }
 }
 
+/// Validate and persist a config edit under the shared config lock before reloading accounts.
 fn edit_config(app: &Arc<App>, edit: impl FnOnce(&mut serde_yaml::Value)) -> Response {
     let _guard = app.config_write.lock();
     let text = match std::fs::read_to_string(&app.cfg_path) {
@@ -680,6 +683,7 @@ async fn get_config(State(app): State<Arc<App>>) -> Json<Value> {
     Json(json!({ "text": text, "path": app.cfg_path.display().to_string() }))
 }
 
+/// Report sanitized delivery status and whether this request may enter managed credentials.
 async fn notification_status(
     State(app): State<Arc<App>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -691,13 +695,16 @@ async fn notification_status(
     status["credential_ui_reason"] = json!(guard.err().unwrap_or("ready"));
     no_store(Json(status).into_response())
 }
+/// Mark a management response as non-cacheable, including rejected credential requests.
 fn no_store(mut response: Response) -> Response {
     response.headers_mut().insert(header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
     response
 }
+/// Return a fixed credential failure without reflecting submitted values.
 fn credential_error(status: StatusCode, message: &'static str) -> Response {
     no_store(err(status, message))
 }
+/// Reject duplicate or non-text headers before interpreting security-sensitive request metadata.
 fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>, &'static str> {
     let mut values = headers.get_all(name).iter();
     let value = values
@@ -709,6 +716,7 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a st
     }
     Ok(value)
 }
+/// Parse a bounded authority without accepting userinfo, whitespace, or URL path components.
 fn credential_host(value: &str, scheme: &str) -> Result<url::Url, &'static str> {
     if value.is_empty()
         || value.len() > 300
@@ -722,6 +730,7 @@ fn credential_host(value: &str, scheme: &str) -> Result<url::Url, &'static str> 
     }
     Ok(url)
 }
+/// Require opt-in secret entry, management bearer authentication, and the configured origin policy.
 fn credential_guard(
     app: &App,
     peer: std::net::IpAddr,
@@ -788,6 +797,7 @@ fn credential_guard(
     }
     credential_origin_check(headers, &expected.origin().ascii_serialization(), mutation)
 }
+/// Require an exact mutation Origin and reject malformed, duplicate, or cross-origin metadata.
 fn credential_origin_check(headers: &HeaderMap, expected: &str, required: bool) -> Result<(), &'static str> {
     let Some(origin) = single_header(headers, "origin")? else {
         return if required { Err("credential_origin_required") } else { Ok(()) };
@@ -818,6 +828,7 @@ struct NotificationCredentialBody {
     #[serde(default)]
     bearer_token: Option<String>,
 }
+/// Accept bounded same-origin JSON and replace a write-only credential bundle.
 async fn put_notification_credentials(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
@@ -854,6 +865,7 @@ async fn put_notification_credentials(
         ),
     }
 }
+/// Authenticate an empty-body deletion without returning the removed credential.
 async fn delete_notification_credentials(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
@@ -882,6 +894,7 @@ async fn delete_notification_credentials(
 }
 
 // JSON prevents ordinary cross-origin forms from triggering a localhost send.
+/// Require JSON admission before attempting a rate-limited destination test.
 async fn test_notification(State(app): State<Arc<App>>, Path(id): Path<String>, Json(body): Json<Value>) -> Response {
     if !body.as_object().is_some_and(|value| value.is_empty()) {
         return err(StatusCode::BAD_REQUEST, "Send an empty JSON object to test a configured destination");
@@ -897,6 +910,7 @@ struct ConfigBody {
     text: String,
 }
 
+/// Validate raw YAML and credential lifecycle constraints before atomically applying it.
 async fn put_config(State(app): State<Arc<App>>, Json(b): Json<ConfigBody>) -> Response {
     let _guard = app.config_write.lock();
     let cfg = match Config::parse(&b.text) {
@@ -946,6 +960,7 @@ struct SettingsBody {
     changes: serde_json::Map<String, Value>,
 }
 
+/// Preserve YAML layout while applying validated structured edits and credential lifecycle guards.
 async fn patch_settings(State(app): State<Arc<App>>, Json(body): Json<SettingsBody>) -> Response {
     let _guard = app.config_write.lock();
     let text = match std::fs::read_to_string(&app.cfg_path) {
@@ -1055,6 +1070,7 @@ mod tests {
     use super::*;
 
     #[test]
+    /// Verify that public credential origin ignores proxy headers and requires mutation origin.
     fn public_credential_origin_ignores_proxy_headers_and_requires_mutation_origin() {
         let cfg = Config {
             auth_dir: "/nonexistent/public-credential-origin-test".into(),
@@ -1189,6 +1205,7 @@ mod tests {
     }
 
     #[test]
+    /// Verify that credential guard accepts http2 authority and rejects conflicting host.
     fn credential_guard_accepts_http2_authority_and_rejects_conflicting_host() {
         let cfg = Config {
             auth_dir: "/nonexistent/credential-h2-test".into(),

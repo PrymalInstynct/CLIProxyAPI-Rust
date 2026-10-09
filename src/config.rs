@@ -202,6 +202,7 @@ impl ModelAlias {
 }
 
 impl Default for Config {
+    /// Initialize opt-in features as disabled and preserve the existing server defaults.
     fn default() -> Self {
         Self {
             host: default_host(),
@@ -337,6 +338,7 @@ impl Config {
         Self::parse(&text)
     }
 
+    /// Parse compatible YAML and validate routing plus notification configuration before applying it.
     pub fn parse(text: &str) -> Result<Self> {
         if text.trim().is_empty() {
             return Ok(Self::default());

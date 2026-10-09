@@ -106,9 +106,11 @@ impl Quota {
     }
 
     #[cfg(test)]
+    /// Use the normal routing-only refresh schedule for baseline tests.
     fn needs_refresh(&self, now: DateTime<Utc>) -> bool {
         self.needs_refresh_for(now, false)
     }
+    /// Retain failure backoff while polling authoritatively for notifications even on busy subscriptions.
     fn needs_refresh_for(&self, now: DateTime<Utc>, notifications: bool) -> bool {
         // A check that brought no data waits 2, 4, 8 ... up to 30 minutes before the next.
         if self.check_failures > 0
@@ -256,6 +258,7 @@ pub fn observe_codex_event(acct: &Account, v: &Value, epoch: u64) {
     }
 }
 
+/// Parse finite Claude shared and model-scoped usage without inventing missing windows.
 fn claude_windows(v: &Value) -> Vec<Window> {
     let rfc = |s: &Value| s.as_str().and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|t| t.with_timezone(&Utc));
     [
@@ -278,6 +281,7 @@ fn claude_windows(v: &Value) -> Vec<Window> {
     .collect()
 }
 
+/// Parse bounded Codex usage windows and authoritative reached-limit indicators.
 fn codex_windows(v: &Value) -> Vec<Window> {
     let rl = &v["rate_limit"];
     let reached = rl["limit_reached"] == true;
@@ -345,6 +349,7 @@ pub async fn poll(app: &App, acct: &Arc<Account>) -> anyhow::Result<()> {
 pub fn authoritative(st: &mut crate::accounts::AccountState, windows: Vec<Window>, plan: Option<String>) {
     authoritative_at(st, windows, plan, Utc::now());
 }
+/// Merge provider usage using the poll start time and preserve windows the provider did not report.
 fn authoritative_at(
     st: &mut crate::accounts::AccountState,
     windows: Vec<Window>,

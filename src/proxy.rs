@@ -62,6 +62,7 @@ pub struct Tracker {
 }
 
 impl Tracker {
+    /// Initialize a request tracker without attributing usage or failure to an account before selection.
     pub fn new(app: &Arc<App>, client: Format, stream: bool, transport: &'static str, model: &str) -> Self {
         app.stats.active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
@@ -101,6 +102,7 @@ impl Tracker {
         }
     }
 
+    /// Record the selected account and its current quota epoch before a provider attempt.
     pub fn attempt(&mut self, acct: &Arc<Account>) {
         self.load = Some(crate::accounts::RequestLoad::new(acct));
         self.log.attempts += 1;
@@ -190,12 +192,14 @@ impl Tracker {
         }
     }
 
+    /// Apply streamed quota evidence only through the epoch associated with its provider attempt.
     fn observe_quota_event(&self, data: &str) {
         if let Some(acct) = &self.acct {
             observe_quota_event(acct, &self.log.model, data, self.quota_epoch);
         }
     }
 
+    /// Finalize usage and routing statistics without allowing stale failures to restore quota exhaustion.
     pub fn finish(&mut self, status: u16, usage: &Usage, error: Option<String>) {
         if self.done {
             return;
@@ -372,6 +376,7 @@ pub fn quota_exhausted(acct: &Account, model: &str, status: u16, body: &str) -> 
     .any(|s| b.contains(s))
 }
 
+/// Reject stale request errors before recording known or model-scoped exhaustion evidence.
 pub fn mark_quota_exhausted(acct: &Account, model: &str, headers: &reqwest::header::HeaderMap, body: &str, epoch: u64) {
     let until = acct
         .exhausted_until(model)
@@ -380,6 +385,7 @@ pub fn mark_quota_exhausted(acct: &Account, model: &str, headers: &reqwest::head
     acct.exhaust(model, until, &format!("subscription quota exhausted: {}", error_message(body)), epoch);
 }
 
+/// Apply streamed quota evidence only through the epoch associated with its provider attempt.
 fn observe_quota_event(acct: &Account, model: &str, data: &str, epoch: u64) {
     let Ok(v) = serde_json::from_str::<Value>(data) else {
         return;
@@ -563,6 +569,7 @@ pub async fn execute(app: Arc<App>, mut call: Call) -> Reply {
     }
 }
 
+/// Route provider attempts with request-scoped quota epochs and the existing retry/admission rules.
 async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
     let cfg = app.cfg();
     let raw_model =

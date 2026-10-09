@@ -707,6 +707,7 @@ pub fn apply(text: &str, changes: &Map<String, Value>) -> Result<(String, Config
     Ok((output, cfg, rewritten))
 }
 
+/// Report changed startup-only settings, including notification secret paths and trust permissions.
 pub fn restart_fields(startup: &Config, current: &Config) -> Vec<&'static str> {
     let mut fields = Vec::new();
     if startup.host != current.host {
@@ -749,6 +750,7 @@ mod tests {
     }
 
     #[test]
+    /// Verify that notification edits preserve layout and operator permissions.
     fn notification_edits_preserve_layout_and_operator_permissions() {
         for prefix in ["", "config-version: 8\n"] {
             let source = format!(
@@ -780,6 +782,7 @@ mod tests {
     }
 
     #[test]
+    /// Verify that notification config rejects inline credentials and marks trust changes for restart.
     fn notification_config_rejects_inline_credentials_and_marks_trust_changes_for_restart() {
         let changes = json!({"notifications":{"enabled":true,"destinations":[{"id":"ops","format":"discord","url":"https://example.net/secret-sentinel"}]}});
         assert!(apply("", changes.as_object().unwrap()).is_err());

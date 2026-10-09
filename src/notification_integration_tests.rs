@@ -8,6 +8,7 @@ use std::{
 struct Temp(PathBuf);
 
 impl Temp {
+    /// Create an isolated temporary test directory without using production credentials.
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!("notification-integration-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&path).unwrap();
@@ -17,11 +18,13 @@ impl Temp {
 }
 
 impl Drop for Temp {
+    /// Release the test task or remove its temporary files when the fixture leaves scope.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
+/// Construct a synthetic management fixture with an isolated auth directory and config file.
 fn app(temp: &Temp, enabled: bool, secrets_dir: Option<&Path>) -> Arc<crate::state::App> {
     let mut cfg = crate::config::Config {
         auth_dir: temp.0.join("auth").to_string_lossy().into_owned(),
@@ -40,6 +43,7 @@ fn app(temp: &Temp, enabled: bool, secrets_dir: Option<&Path>) -> Arc<crate::sta
     crate::state::App::new(cfg, temp.0.join("config.yaml"))
 }
 
+/// Provision a synthetic external secret with private permissions on Unix.
 fn private_file(path: &Path, contents: &str) {
     std::fs::write(path, contents).unwrap();
     #[cfg(unix)]
@@ -52,11 +56,13 @@ fn private_file(path: &Path, contents: &str) {
 struct TestServer(tokio::task::JoinHandle<()>);
 
 impl Drop for TestServer {
+    /// Release the test task or remove its temporary files when the fixture leaves scope.
     fn drop(&mut self) {
         self.0.abort();
     }
 }
 
+/// Run the synthetic management router on an ephemeral loopback port.
 async fn serve(app: Arc<crate::state::App>) -> (String, TestServer) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -68,6 +74,7 @@ async fn serve(app: Arc<crate::state::App>) -> (String, TestServer) {
 }
 
 #[tokio::test]
+/// Verify that notification test blocks loopback and persists only sanitized details.
 async fn notification_test_blocks_loopback_and_persists_only_sanitized_details() {
     let temp = Temp::new();
     let secrets = temp.0.join("secrets");
@@ -110,6 +117,7 @@ async fn notification_test_blocks_loopback_and_persists_only_sanitized_details()
 }
 
 #[tokio::test]
+/// Verify that notification management requires key and test rejects form content type.
 async fn notification_management_requires_key_and_test_rejects_form_content_type() {
     let temp = Temp::new();
     let app = app(&temp, false, None);
@@ -131,7 +139,52 @@ async fn notification_management_requires_key_and_test_rejects_form_content_type
     assert!(!temp.0.join("auth/.quota-notifications").exists());
 }
 
+#[cfg(not(unix))]
+#[tokio::test]
+/// Verify that platforms without Unix permission protection refuse managed writes and keep external delivery available.
+async fn managed_credentials_fail_closed_on_non_unix_without_disabling_external_credentials() {
+    let temp = Temp::new();
+    let secrets = temp.0.join("secrets");
+    std::fs::create_dir(&secrets).unwrap();
+    let app = app(&temp, true, Some(&secrets));
+    let mut config = (*app.cfg()).clone();
+    config.notifications.credential_ui_enabled = true;
+    app.set_config(config);
+    let (origin, _server) = serve(app.clone()).await;
+    let client = reqwest::Client::new();
+    let route = format!("{origin}/notifications/ops/credentials");
+    let response = client
+        .put(&route)
+        .bearer_auth("notification-test-management-key")
+        .header(reqwest::header::ORIGIN, &origin)
+        .json(&json!({"url": "https://hooks.example.invalid/windows-sentinel"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.headers()[reqwest::header::CACHE_CONTROL], "no-store");
+    assert_eq!(response.json::<Value>().await.unwrap()["error"], "managed_credentials_unsupported_platform");
+    assert!(!temp.0.join("auth/.notification-credentials").exists());
+    assert_eq!(app.notifications.status(&app)["destinations"][0]["credential_editable"], false);
+    let removed = client
+        .delete(&route)
+        .bearer_auth("notification-test-management-key")
+        .header(reqwest::header::ORIGIN, &origin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(removed.json::<Value>().await.unwrap()["error"], "managed_credentials_unsupported_platform");
+
+    private_file(&secrets.join("ops.url"), "https://127.0.0.1:9/windows-external-sentinel");
+    let status = app.notifications.status(&app);
+    assert_eq!(status["destinations"][0]["credential_source"], "external");
+    assert_eq!(status["destinations"][0]["credential_ready"], true);
+    assert_eq!(app.notifications.test(&app, "ops").await.unwrap_err(), "blocked_address");
+}
+
 #[test]
+/// Verify that notification config rejects inline url credentials.
 fn notification_config_rejects_inline_url_credentials() {
     let error = crate::config::Config::parse(
         "notifications:\n  enabled: true\n  destinations:\n    - id: ops\n      format: discord\n      url: https://example.invalid/secret-sentinel\n",
@@ -141,6 +194,7 @@ fn notification_config_rejects_inline_url_credentials() {
 }
 
 #[tokio::test]
+/// Verify that hot config cannot expand startup notification secret access.
 async fn hot_config_cannot_expand_startup_notification_secret_access() {
     let temp = Temp::new();
     let startup_secrets = temp.0.join("startup-secrets");
@@ -170,6 +224,7 @@ async fn hot_config_cannot_expand_startup_notification_secret_access() {
 }
 
 #[tokio::test]
+/// Verify that status does not create notification state when feature is disabled.
 async fn status_does_not_create_notification_state_when_feature_is_disabled() {
     let temp = Temp::new();
     let app = app(&temp, false, None);
@@ -187,6 +242,7 @@ async fn status_does_not_create_notification_state_when_feature_is_disabled() {
 }
 
 #[tokio::test]
+/// Verify that management settings round trip timezone and reject invalid zone.
 async fn management_settings_round_trip_timezone_and_reject_invalid_zone() {
     let temp = Temp::new();
     let app = app(&temp, false, None);

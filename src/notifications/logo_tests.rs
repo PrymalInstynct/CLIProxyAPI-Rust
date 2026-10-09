@@ -8,10 +8,12 @@ use axum::{
 use parking_lot::Mutex;
 use std::{net::SocketAddr, sync::Arc};
 
+/// Create a synthetic Discord destination without webhook credentials.
 fn discord() -> Destination {
     Destination { id: "ops".into(), format: Format::Discord, enabled: true, chat_id: None }
 }
 
+/// Create a credential-free event fixture with deterministic timestamps and scopes.
 fn sample_event(provider: &str, event: &str) -> Event {
     Event {
         version: 1,
@@ -28,10 +30,12 @@ fn sample_event(provider: &str, event: &str) -> Event {
     }
 }
 
+/// Build a human presentation fixture without modifying the durable event.
 fn presentation() -> Presentation {
     Presentation::new(Some("Synthetic subscription"), chrono_tz::UTC)
 }
 
+/// Read the attachment filenames declared by a synthetic Discord payload.
 fn attachment_names(payload: &Value) -> Vec<&str> {
     payload["attachments"]
         .as_array()
@@ -42,6 +46,7 @@ fn attachment_names(payload: &Value) -> Vec<&str> {
 }
 
 #[test]
+/// Verify that discord provider quota events attach one logo without changing message content.
 fn discord_provider_quota_events_attach_one_logo_without_changing_message_content() {
     let destination = discord();
     let logos = presentation();
@@ -66,6 +71,7 @@ fn discord_provider_quota_events_attach_one_logo_without_changing_message_conten
 }
 
 #[test]
+/// Verify that test notifications preview both logos unknown providers do not get a logo and other formats are unchanged.
 fn test_notifications_preview_both_logos_unknown_providers_do_not_get_a_logo_and_other_formats_are_unchanged() {
     let logos = presentation();
     let plain = Presentation::new(Some("Synthetic subscription"), chrono_tz::UTC).with_provider_logos(false);
@@ -96,6 +102,7 @@ fn test_notifications_preview_both_logos_unknown_providers_do_not_get_a_logo_and
 }
 
 #[test]
+/// Verify that provider logos are preview attachments only when enabled.
 fn provider_logos_are_preview_attachments_only_when_enabled() {
     let destination = Destination { format: Format::Generic, ..discord() };
     let event = sample_event("claude", "quota.exhausted");
@@ -121,6 +128,7 @@ fn provider_logos_are_preview_attachments_only_when_enabled() {
 }
 
 #[test]
+/// Verify that provider logos config defaults on and accepts explicit opt out.
 fn provider_logos_config_defaults_on_and_accepts_explicit_opt_out() {
     assert!(crate::notifications::Config::default().provider_logos);
     assert!(crate::config::Config::parse("").unwrap().notifications.provider_logos);
@@ -147,6 +155,7 @@ struct Received {
     parts: Vec<Part>,
 }
 
+/// Capture one loopback multipart request to verify the actual attachment bytes and metadata.
 async fn receive_discord(
     State(received): State<Arc<Mutex<Option<Received>>>>,
     OriginalUri(uri): OriginalUri,
@@ -173,12 +182,14 @@ async fn receive_discord(
 struct TestServer(tokio::task::JoinHandle<()>);
 
 impl Drop for TestServer {
+    /// Release the test task or remove its temporary files when the fixture leaves scope.
     fn drop(&mut self) {
         self.0.abort();
     }
 }
 
 #[tokio::test]
+/// Verify that discord multipart matches payload metadata and bundled png bytes.
 async fn discord_multipart_matches_payload_metadata_and_bundled_png_bytes() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address: SocketAddr = listener.local_addr().unwrap();
