@@ -231,7 +231,8 @@ function notificationLogTime(timestamp) {
 function notificationActivityHTML() {
   const n = S.notifications;
   const status = n.status;
-  const logs = (status?.logs || []).filter((row) => !n.filter || row.destination === n.filter);
+  const logs = (status?.logs || []).filter((row) => !n.filter || row.destination === n.filter)
+    .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
   return `<div class="cfg-section-head"><h3>Delivery activity</h3><button type="button" class="btn ghost small" data-config-act="refresh-notifications" ${n.loading ? 'disabled' : ''}>${n.loading ? 'Refreshing…' : 'Refresh activity'}</button></div>
     ${n.error ? `<p class="msg err" role="alert">${esc(n.error)}</p>` : ''}
     ${status ? `<p class="cfg-description" role="status">${status.enabled ? (status.active ? 'Monitoring active' : 'Monitoring unavailable') : 'Notifications off'} · ${fmt(status.pending)} pending deliveries${status.error ? ` · ${esc(status.error)}` : ''}</p>${status.warning ? `<p class="msg warn" role="status">${esc(status.warning)}</p>` : ''}` : '<p class="cfg-description">Loading delivery status…</p>'}
