@@ -17,15 +17,6 @@ notifications:
   provider-logos: true # Discord-only provider logo thumbnails; default true
   credential-ui-enabled: false # opt in before entering secrets in the dashboard
   credential-public-url: https://proxy.example.com # optional HTTPS origin; hot-applied; leave blank for localhost/native TLS
-  # Optional. Defaults to <auth-dir>/.notification-secrets.
-  secrets-dir: /run/notification-secrets
-  # Optional startup-only PEM CA bundle for private HTTPS services.
-  ca-file: /run/certs/internal-webhook-ca.pem
-  # Optional startup-only permission for one self-hosted private webhook.
-  private-endpoints:
-    - host: chat.example.net
-      port: 443
-      cidrs: [10.1.2.3/32] # webhook destination address
   destinations:
     - id: ops-discord
       format: discord
@@ -99,7 +90,7 @@ The browser requires JSON same-origin requests to prevent ordinary cross-origin 
 
 Credential writes require secret entry to be enabled, an authenticated request, HTTPS in the browser, and a mandatory `Origin` matching the configured public dashboard origin. The `credential-ui-enabled` setting defaults to false. **Public dashboard URL** is a normalized HTTPS origin, not a webhook URL; the dashboard rejects values containing credentials, a path, query, or fragment. The origin check prevents cross-origin writes but is not proof that TLS is configured correctly at the proxy. The deployment administrator must configure and verify TLS termination and routing. Direct localhost access and native server TLS can leave the URL blank.
 
-Advanced deployments can still use `notifications.credential-proxy-cidrs` to trust exact reverse-proxy peers for the previous forwarded-protocol setup. This list is optional compatibility configuration, startup-only, and requires a restart after edits. It is not part of the normal **Secret entry** setup. Never trust broad ranges or shared Docker gateway addresses. A direct HTTP request is accepted only from a loopback peer to `localhost` or a loopback IP Host, without forwarding headers.
+Advanced deployments can use `notifications.credential-proxy-cidrs` to trust exact reverse-proxy peers for forwarded-protocol checks. This list is optional, startup-only, and requires a restart after edits. It is not part of the normal **Secret entry** setup. Never trust broad ranges or shared Docker gateway addresses. A direct HTTP request is accepted only from a loopback peer to `localhost` or a loopback IP Host, without forwarding headers.
 
 Example for an advanced reverse-proxy compatibility setup:
 
@@ -128,6 +119,11 @@ For externally managed files, create one file for each destination. The filename
 Files must be regular files, must not be symlinks, must be at most 8 KiB, and on Unix must be owned by the server's user or root with no group or world permissions. Do not change permissions on a read-only container secret mount; provision it with an accepted owner and mode. Changing the `secrets-dir` setting or private network permissions requires a restart.
 
 For Docker Compose, mount the external secret directory read-only and set `secrets-dir` to its container path. The auth directory remains the persistent writable location for accounts, managed credentials, and notification state:
+
+```yaml
+notifications:
+  secrets-dir: /run/notification-secrets # defaults to <auth-dir>/.notification-secrets
+```
 
 ```yaml
 services:
@@ -164,6 +160,17 @@ Environment values are inherited when the process starts. Avoid putting them dir
 ## Network and privacy
 
 Delivery uses HTTPS with certificate validation. To trust an internal certificate authority, set startup-only `ca-file` to a regular PEM bundle no larger than 1 MiB; symlinks and invalid or empty bundles are rejected. This adds trusted roots while keeping normal TLS certificate verification enabled. Changing the `ca-file` setting requires a restart; replacing the bundle file takes effect on the next delivery attempt. Redirects, environment proxy discovery, and notification proxy configuration are not used. Public webhook hostnames are resolved and checked before connection; private, loopback, link-local and metadata addresses are blocked by default. If a self-hosted service must use a private address, allow its exact hostname, port and destination CIDR through startup-only `private-endpoints` configuration. You can list at most 16 entries, with up to 16 CIDRs per entry; CIDRs must be nonempty and cannot be `/0`. Only private IPv4/ULA addresses can use these exceptions; loopback, link-local and metadata ranges stay blocked. Treat this as a network permission and restrict it to the webhook server's exact addresses. Changes require restarting the server.
+
+Example for a self-hosted HTTPS webhook that needs a private address and an internal CA:
+
+```yaml
+notifications:
+  ca-file: /run/certs/internal-webhook-ca.pem
+  private-endpoints:
+    - host: chat.example.net
+      port: 443
+      cidrs: [10.1.2.3/32] # exact webhook destination address
+```
 
 The durable event and delivery journal contain no account display name, email, OAuth token, credential filename, provider response, request body, webhook URL or secret. The subscription ID is opaque and local to this installation. The live status response resolves a current display name for delivery activity without persisting it. Delivery records persist the sanitized credential-free event and destination IDs in the auth directory. Protect and back up that directory as application state; do not expose it as a public volume. Secret file contents are resolved for delivery and are not written to the notification journal or management responses.
 
