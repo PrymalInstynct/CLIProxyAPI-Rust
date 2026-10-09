@@ -52,6 +52,7 @@ pub struct Tracker {
     log: RequestLog,
     started: Instant,
     acct: Option<Arc<Account>>,
+    quota_epoch: u64,
     /// Stream progress must outlive the suspended generator when its body is dropped.
     stream_usage: Usage,
     stream_error: Option<(u16, String)>,
@@ -67,6 +68,7 @@ impl Tracker {
             app: app.clone(),
             started: Instant::now(),
             acct: None,
+            quota_epoch: 0,
             stream_usage: Usage::default(),
             stream_error: None,
             stream_finished: false,
@@ -104,7 +106,13 @@ impl Tracker {
         self.log.attempts += 1;
         self.log.provider = acct.provider.as_str().to_string();
         self.log.account = acct.label.clone();
+        self.quota_epoch = acct.quota_epoch();
         self.acct = Some(acct.clone());
+    }
+
+    /// Bind the epoch immediately before sending each upstream attempt.
+    pub fn request_epoch(&mut self, epoch: u64) {
+        self.quota_epoch = epoch;
     }
 
     pub fn session(&mut self, key: Option<&str>, source: Option<&'static str>, cfg: &crate::config::Config) {
@@ -184,7 +192,7 @@ impl Tracker {
 
     fn observe_quota_event(&self, data: &str) {
         if let Some(acct) = &self.acct {
-            observe_quota_event(acct, &self.log.model, data);
+            observe_quota_event(acct, &self.log.model, data, self.quota_epoch);
         }
     }
 
@@ -206,7 +214,7 @@ impl Tracker {
             if let Some(message) = &self.log.error
                 && quota_exhausted(a, &self.log.model, status, message)
             {
-                mark_quota_exhausted(a, &self.log.model, &reqwest::header::HeaderMap::new(), message);
+                mark_quota_exhausted(a, &self.log.model, &reqwest::header::HeaderMap::new(), message, self.quota_epoch);
             }
             let mut st = a.state.lock();
             st.counters.requests += 1;
@@ -364,15 +372,15 @@ pub fn quota_exhausted(acct: &Account, model: &str, status: u16, body: &str) -> 
     .any(|s| b.contains(s))
 }
 
-pub fn mark_quota_exhausted(acct: &Account, model: &str, headers: &reqwest::header::HeaderMap, body: &str) {
+pub fn mark_quota_exhausted(acct: &Account, model: &str, headers: &reqwest::header::HeaderMap, body: &str, epoch: u64) {
     let until = acct
         .exhausted_until(model)
         .or_else(|| reset_after(headers, body))
         .unwrap_or_else(|| Utc::now() + Duration::minutes(5));
-    acct.exhaust(model, until, &format!("subscription quota exhausted: {}", error_message(body)));
+    acct.exhaust(model, until, &format!("subscription quota exhausted: {}", error_message(body)), epoch);
 }
 
-fn observe_quota_event(acct: &Account, model: &str, data: &str) {
+fn observe_quota_event(acct: &Account, model: &str, data: &str, epoch: u64) {
     let Ok(v) = serde_json::from_str::<Value>(data) else {
         return;
     };
@@ -380,7 +388,7 @@ fn observe_quota_event(acct: &Account, model: &str, data: &str) {
     if error.is_object() {
         let status = v["status"].as_u64().unwrap_or(429) as u16;
         if quota_exhausted(acct, model, status, &error.to_string()) {
-            mark_quota_exhausted(acct, model, &reqwest::header::HeaderMap::new(), &error.to_string());
+            mark_quota_exhausted(acct, model, &reqwest::header::HeaderMap::new(), &error.to_string(), epoch);
         }
     }
 }
@@ -644,6 +652,7 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
         }
 
         let quota_epoch = acct.quota_epoch();
+        tracker.request_epoch(quota_epoch);
         let provider = acct.provider;
         if call.body["previous_response_id"].is_string()
             && ((provider == Provider::Codex && acct.is_oauth()) || !provider.wires().contains(&Format::Responses))
@@ -773,7 +782,7 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
                 formats::error_body(call.format, status, &msg)
             };
             if quota_exhausted(&acct, &model, status, &text) {
-                mark_quota_exhausted(&acct, &model, &headers, &text);
+                mark_quota_exhausted(&acct, &model, &headers, &text, quota_epoch);
                 app.broadcast("accounts", Value::Null);
                 tried.push(acct.id.clone());
                 last_error = Some((status, client_body));
@@ -851,6 +860,7 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
                 return collect_passthrough(Box::pin(resp.bytes_stream()), native, tracker, call.format).await;
             }
             let text = resp.text().await.unwrap_or_default();
+            tracker.observe_quota_event(&text);
             let mut v: Value = match serde_json::from_str(&text) {
                 Ok(v) => v,
                 // An unlabelled stream after all: rebuild the final object from it.
@@ -872,7 +882,7 @@ async fn execute_inner(app: Arc<App>, call: Call) -> Reply {
         let events = if devin {
             crate::devin::event_stream(resp, names)
         } else {
-            event_stream(resp, native, is_sse, names, acct.clone(), model.clone())
+            event_stream(resp, native, is_sse, names, acct.clone(), model.clone(), quota_epoch)
         };
         let client_model = model.clone();
         if call.stream {
@@ -901,6 +911,7 @@ fn event_stream(
     names: HashMap<String, String>,
     acct: Arc<Account>,
     model: String,
+    quota_epoch: u64,
 ) -> EventStream {
     let rename = move |ev: Event| match ev {
         Event::ToolStart { key, id, name } => {
@@ -912,7 +923,7 @@ fn event_stream(
     if !is_sse {
         return Box::pin(async_stream::stream! {
             let text = resp.text().await.unwrap_or_default();
-            observe_quota_event(&acct, &model, &text);
+            observe_quota_event(&acct, &model, &text, quota_epoch);
             let evs = match serde_json::from_str::<Value>(&text) {
                 Ok(v) => formats::full_to_events(native, &v),
                 // Mislabelled stream: decode it as SSE after all.
@@ -921,7 +932,7 @@ fn event_stream(
                     let mut parser = formats::parser(native);
                     let mut out = Vec::new();
                     for sse in dec.push(text.as_bytes()).into_iter().chain(dec.finish()) {
-                        observe_quota_event(&acct, &model, &sse.data);
+                        observe_quota_event(&acct, &model, &sse.data, quota_epoch);
                         parser.feed(&sse, &mut out);
                     }
                     out
@@ -941,7 +952,7 @@ fn event_stream(
             match body.next().await {
                 Some(Ok(chunk)) => {
                     for sse in dec.push(&chunk) {
-                        observe_quota_event(&acct, &model, &sse.data);
+                        observe_quota_event(&acct, &model, &sse.data, quota_epoch);
                         parser.feed(&sse, &mut out);
                     }
                 }
@@ -952,7 +963,7 @@ fn event_stream(
                 }
                 None => {
                     for sse in dec.finish() {
-                        observe_quota_event(&acct, &model, &sse.data);
+                        observe_quota_event(&acct, &model, &sse.data, quota_epoch);
                         parser.feed(&sse, &mut out);
                     }
                     for ev in out.drain(..) { yield rename(ev); }

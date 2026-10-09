@@ -51,7 +51,7 @@ function configField(path, label, opts = {}) {
   const input = `<input id="${id}" data-cfg="${configPath(path)}" ${opts.nullable ? 'data-nullable="true"' : ''}
     type="${opts.type || 'text'}" value="${esc(shown)}" placeholder="${esc(placeholder)}" ${secret ? 'data-secret="true"' : ''}
     ${opts.mono !== false ? 'class="mono" spellcheck="false"' : ''}
-    ${opts.required && !(secret && value) ? 'required' : ''} ${opts.min != null ? `min="${opts.min}"` : ''}
+    ${opts.readonly ? 'readonly' : ''} ${opts.required && !(secret && value) ? 'required' : ''} ${opts.min != null ? `min="${opts.min}"` : ''}
     ${opts.max != null ? `max="${opts.max}"` : ''} ${opts.type === 'number' ? 'step="1"' : ''}
     ${secret ? 'autocomplete="new-password"' : 'autocomplete="off"'}
     aria-describedby="${opts.help ? `${id}-help ` : ''}${id}-error" ${error ? 'aria-invalid="true"' : ''}>`;
@@ -77,8 +77,8 @@ function configSwitch(path, label, help = '', restart = false) {
       ${help ? `aria-describedby="${id}-help"` : ''} data-config-act="switch" data-path="${configPath(path)}"></button></div>`;
 }
 
-function configRemove(path, label = 'Remove row') {
-  return `<button type="button" class="btn ghost small danger" data-config-act="remove" data-path="${configPath(path)}" aria-label="${esc(label)}">Remove</button>`;
+function configRemove(path, label = 'Remove row', disabled = false) {
+  return `<button type="button" class="btn ghost small danger" data-config-act="remove" data-path="${configPath(path)}" aria-label="${esc(label)}" ${disabled ? 'disabled' : ''}>Remove</button>`;
 }
 
 function configStrings(path, label, help = '', secret = false) {
@@ -399,9 +399,10 @@ function configNotificationsHTML() {
     ${list.length ? list.map((d, i) => {
       const path = ['notifications', 'destinations', i];
       const saved = n.status?.destinations?.find((row) => row.id === d.id);
+      const credentialsLocked = saved?.credential_source === 'managed' && saved.credential_configured;
       const canTest = !configDirty() && !rawDirty() && n.status?.enabled && saved?.enabled && saved?.credential_ready && !n.busy;
-      return `<section class="notification-destination" aria-label="Destination ${i + 1}"><div class="cfg-list-head"><h3>Destination ${i + 1}</h3>${configRemove(path, `Remove destination ${i + 1}`)}</div>
-        <div class="cfg-grid">${configField([...path, 'id'], 'Destination ID', { required: true, placeholder: 'ops-discord', help: 'Unique lowercase letters, numbers and hyphens; up to 32 characters. Credentials are associated with this ID.' })}
+      return `<section class="notification-destination" aria-label="Destination ${i + 1}"><div class="cfg-list-head"><h3>Destination ${i + 1}</h3>${configRemove(path, `Remove destination ${i + 1}`, credentialsLocked)}</div>
+        <div class="cfg-grid">${configField([...path, 'id'], 'Destination ID', { required: true, readonly: credentialsLocked, placeholder: 'ops-discord', help: credentialsLocked ? 'Remove saved credentials before deleting this destination or changing its ID.' : 'Unique lowercase letters, numbers and hyphens; up to 32 characters. Credentials are associated with this ID.' })}
           ${configSelect([...path, 'format'], 'Platform', NOTIFICATION_FORMATS)}
           ${d.format === 'telegram' ? configField([...path, 'chat-id'], 'Telegram chat ID', { required: true, placeholder: '-1001234567890', help: 'The chat or channel your bot can send messages to.' }) : ''}</div>
         ${configSwitch([...path, 'enabled'], 'Enable destination', 'Send quota events to this destination when quota notifications are on.')}
@@ -448,6 +449,12 @@ function updateNotificationActions() {
     const panel = document.getElementById(`notification-credentials-${index}`);
     if (!panel || n.credentialEditor === d.id || n.credentialRemove === d.id) continue;
     const saved = n.status?.destinations?.find((row) => row.id === d.id);
+    const locked = saved?.credential_source === 'managed' && saved.credential_configured;
+    const card = panel.closest('.notification-destination');
+    const idInput = document.getElementById(configId(['notifications', 'destinations', index, 'id']));
+    if (idInput) idInput.readOnly = !!locked;
+    const removeButton = card.querySelector('[data-config-act="remove"]');
+    if (removeButton) removeButton.disabled = !!locked;
     const signature = JSON.stringify([d.id, saved?.credential_source, saved?.credential_configured, saved?.credential_ready, saved?.credential_editable, n.status?.credential_ui_enabled, n.status?.credential_ui_ready, n.status?.credential_public_url, dirty, n.busy, n.credentialMsg]);
     if (panel.dataset.signature !== signature) {
       panel.innerHTML = notificationCredentialControls(d, saved, index);

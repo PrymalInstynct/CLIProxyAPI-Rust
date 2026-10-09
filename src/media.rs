@@ -141,6 +141,7 @@ async fn send(
                 body["model"].as_str().unwrap_or_default(),
                 &response_headers,
                 &text,
+                epoch,
             );
         }
         let error = serde_json::from_str::<Value>(&text)
@@ -415,6 +416,8 @@ where
             last = Some(fail(401, format!("token refresh failed: {e}")));
             continue;
         }
+        let epoch = acct.quota_epoch();
+        tracker.request_epoch(epoch);
         match op(acct.clone(), upstream_model).await {
             Ok(v) => {
                 acct.record_ok();
@@ -434,6 +437,7 @@ where
                         &model,
                         &reqwest::header::HeaderMap::new(),
                         &body.to_string(),
+                        epoch,
                     );
                     last = Some((status, body));
                     continue;

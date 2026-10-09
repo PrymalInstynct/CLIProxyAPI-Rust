@@ -525,8 +525,7 @@ impl Account {
     }
 
     /// Records confirmed quota exhaustion, unless a banked reset is being applied.
-    pub fn exhaust(&self, model: &str, until: DateTime<Utc>, reason: &str) {
-        let epoch = self.quota_epoch();
+    pub fn exhaust(&self, model: &str, until: DateTime<Utc>, reason: &str, epoch: u64) {
         self.cool_quota(model, until, reason, epoch);
     }
 
@@ -542,7 +541,7 @@ impl Account {
 
     pub fn cool_quota(&self, model: &str, until: DateTime<Utc>, reason: &str, epoch: u64) {
         let mut st = self.state.lock();
-        if st.quota_epoch == epoch && !st.quota_refreshing {
+        if st.quota_epoch == epoch && !st.quota_refreshing && !st.disabled {
             st.quota_cooldowns.insert(model.to_string(), until);
             if st.notifications_enabled {
                 st.notification_evidence.exhaust(model);
@@ -954,6 +953,9 @@ impl Pool {
                     };
                     *prev.cred.write() = s.cred;
                     let mut st = prev.state.lock();
+                    if st.disabled != s.disabled {
+                        st.quota_epoch += 1;
+                    }
                     st.disabled = s.disabled;
                     st.notifications_enabled = cfg.notifications.enabled;
                     if !st.notifications_enabled {
@@ -996,6 +998,7 @@ impl Pool {
                         last_used: st.last_used,
                         counters: st.counters.clone(),
                         quota: st.quota.clone(),
+                        quota_epoch: st.quota_epoch + u64::from(st.disabled != s.disabled),
                         notification_evidence: st.notification_evidence.clone(),
                         ..Default::default()
                     }

@@ -665,6 +665,9 @@ fn edit_config(app: &Arc<App>, edit: impl FnOnce(&mut serde_yaml::Value)) -> Res
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     };
+    if let Err(message) = app.notifications.validate_destination_change(app, &cfg) {
+        return err(StatusCode::CONFLICT, message);
+    }
     if let Err(e) = std::fs::write(&app.cfg_path, out) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
@@ -900,6 +903,9 @@ async fn put_config(State(app): State<Arc<App>>, Json(b): Json<ConfigBody>) -> R
         Ok(c) => c,
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
+    if let Err(message) = app.notifications.validate_destination_change(&app, &cfg) {
+        return err(StatusCode::CONFLICT, message);
+    }
     if let Err(e) = std::fs::write(&app.cfg_path, &b.text) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
@@ -956,6 +962,9 @@ async fn patch_settings(State(app): State<Arc<App>>, Json(body): Json<SettingsBo
         Ok(result) => result,
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
+    if let Err(message) = app.notifications.validate_destination_change(&app, &cfg) {
+        return err(StatusCode::CONFLICT, message);
+    }
     let mut response = match settings_response(&app, &out) {
         Ok(body) => body,
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("{e:#}")),

@@ -211,10 +211,13 @@ async fn watch(app: Arc<App>) {
             cfg_time = t;
             let _guard = app.config_write.lock();
             match std::fs::read_to_string(&app.cfg_path).map_err(anyhow::Error::from).and_then(|s| Config::parse(&s)) {
-                Ok(cfg) => {
-                    tracing::info!("config reloaded");
-                    app.set_config(cfg);
-                }
+                Ok(cfg) => match app.notifications.validate_destination_change(&app, &cfg) {
+                    Ok(()) => {
+                        tracing::info!("config reloaded");
+                        app.set_config(cfg);
+                    }
+                    Err(message) => tracing::error!("config not reloaded: {message}"),
+                },
                 Err(e) => tracing::error!("config not reloaded: {e:#}"),
             }
         }

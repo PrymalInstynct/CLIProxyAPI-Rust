@@ -376,6 +376,7 @@ impl Service {
         url: String,
         bearer_token: Option<String>,
     ) -> Result<(), &'static str> {
+        let _config_guard = app.config_write.lock();
         let _guard = self.credentials_write.lock();
         let cfg = app.cfg();
         if !cfg.notifications.credential_ui_enabled {
@@ -400,22 +401,41 @@ impl Service {
         Ok(())
     }
     pub fn remove_credentials(&self, app: &App, id: &str) -> Result<(), &'static str> {
+        let _config_guard = app.config_write.lock();
         let _guard = self.credentials_write.lock();
         let cfg = app.cfg();
         if !cfg.notifications.credential_ui_enabled {
             return Err("credential_ui_disabled");
         }
-        let destination = cfg
-            .notifications
-            .destinations
-            .iter()
-            .find(|destination| destination.id == id)
-            .ok_or("destination_unavailable")?;
-        if delivery::external_present(&self.secrets, destination) {
+        if !valid_id(id) {
+            return Err("invalid_destination");
+        }
+        // Administrators can clean up an orphan left by an offline YAML edit.
+        let destination = Destination { id: id.into(), format: Format::Generic, enabled: false, chat_id: None };
+        if delivery::external_present(&self.secrets, &destination) {
             return Err("credentials_externally_managed");
         }
         credentials::remove(&self.root, id)?;
         app.broadcast("notifications", Value::Null);
+        Ok(())
+    }
+    /// Call under config_write so credential saves cannot race destination edits.
+    pub fn validate_destination_change(&self, app: &App, next: &AppConfig) -> Result<(), &'static str> {
+        let current = app.cfg();
+        for destination in &current.notifications.destinations {
+            if !next.notifications.destinations.iter().any(|entry| entry.id == destination.id)
+                && credentials::present(&self.root, &destination.id)
+            {
+                return Err("Remove saved notification credentials before deleting or renaming a destination.");
+            }
+        }
+        for destination in &next.notifications.destinations {
+            if !current.notifications.destinations.iter().any(|entry| entry.id == destination.id)
+                && credentials::present(&self.root, &destination.id)
+            {
+                return Err("This destination ID already has saved credentials. Remove them before reusing the ID.");
+            }
+        }
         Ok(())
     }
     pub fn reset_due(&self, acct: &Account, now: chrono::DateTime<Utc>) -> bool {
@@ -479,29 +499,113 @@ fn log(destination: &str, event: &Event, attempt: u8, outcome: &delivery::Outcom
         detail: outcome.reason.into(),
     }
 }
+// Fresh evidence is deliberately memory-only: durable quota state is not proof that a
+// subscription is still available after a restart or an administrator pauses it.
+#[derive(Clone, Default)]
+struct FreshEvidence {
+    authoritative: BTreeSet<String>,
+    exhausted: BTreeSet<String>,
+}
+fn window_key(name: &str, model: Option<&str>) -> String {
+    format!("{}:{}", name, model.unwrap_or("*"))
+}
+fn blockers(subscription: &Subscription) -> Vec<String> {
+    subscription
+        .windows
+        .values()
+        .filter(|window| window.exhausted)
+        .map(|window| {
+            if window.name == "unknown" {
+                window.model.as_ref().map(|model| format!("unknown {model}")).unwrap_or_else(|| window.name.clone())
+            } else {
+                window.name.clone()
+            }
+        })
+        .collect()
+}
+impl FreshEvidence {
+    fn record(&mut self, subscription: &Subscription, observation: &state::Observation) {
+        for window in observation.windows.iter().filter(|w| state::valid_window(w)) {
+            let key = window_key(&window.name, window.model.as_deref());
+            // Match the reducer: elapsed or superseded samples are not confirmation.
+            if window.resets_at.is_some_and(|reset| reset <= observation.at)
+                || subscription.windows.get(&key).is_some_and(|old| old.observed_at > observation.at)
+            {
+                continue;
+            }
+            if observation.authoritative {
+                self.authoritative.insert(key.clone());
+            }
+            if window.used >= 100.0 {
+                self.exhausted.insert(key);
+            }
+        }
+        if let Some(scope) = &observation.unknown {
+            self.exhausted.insert(window_key("unknown", (scope != "*").then_some(scope.as_str())));
+        }
+        if observation.authoritative
+            && observation.windows.iter().any(|w| w.name == "5h" && w.model.is_none())
+            && observation.windows.iter().any(|w| w.name == "week" && w.model.is_none())
+        {
+            for unknown in subscription.windows.values().filter(|w| w.name == "unknown") {
+                let applicable =
+                    |model: &Option<String>| model.is_none() || unknown.model.is_none() || *model == unknown.model;
+                let covered = subscription
+                    .windows
+                    .values()
+                    .filter(|w| w.name != "unknown" && applicable(&w.model))
+                    .all(|old| observation.windows.iter().any(|w| w.name == old.name && w.model == old.model));
+                let available = observation.windows.iter().filter(|w| applicable(&w.model)).all(|w| {
+                    state::valid_window(w) && w.used < 100.0 && w.resets_at.is_none_or(|reset| reset > observation.at)
+                });
+                if covered && available && unknown.observed_at <= observation.at {
+                    self.authoritative.insert(window_key("unknown", unknown.model.as_deref()));
+                }
+            }
+        }
+    }
+    fn complete(&self, subscription: &Subscription) -> bool {
+        !subscription.windows.is_empty() && subscription.windows.keys().all(|key| self.authoritative.contains(key))
+    }
+    fn permits(&self, event: &Event, subscription: &Subscription, resumed: bool) -> bool {
+        let key = window_key(&event.window, event.model.as_deref());
+        match event.event.as_str() {
+            "quota.exhausted" => self.exhausted.contains(&key),
+            "quota.available" => self.complete(subscription),
+            "quota.window_recovered" => self.authoritative.contains(&key) && (!resumed || self.complete(subscription)),
+            _ => false,
+        }
+    }
+}
 pub async fn worker(app: Arc<App>) {
     let mut seen: BTreeMap<String, u64> = BTreeMap::new();
-    let mut ready = BTreeSet::new();
+    let mut fresh: BTreeMap<String, FreshEvidence> = BTreeMap::new();
+    let mut resumed = BTreeSet::new();
+    let mut capture_resumed = true;
     let mut fresh_after: BTreeMap<String, chrono::DateTime<Utc>> = BTreeMap::new();
     let mut enabled_since = app.started;
-    let mut was_enabled = false;
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let cfg = app.cfg();
         if !cfg.notifications.enabled {
             seen.clear();
-            ready.clear();
-            was_enabled = false;
+            fresh.clear();
+            capture_resumed = true;
+            enabled_since = Utc::now();
             continue;
-        }
-        if !was_enabled {
-            enabled_since = app.started;
-            was_enabled = true;
         }
         if app.notifications.open().is_err() {
             continue;
         }
-        let salt = app.notifications.inner.lock().store.as_ref().unwrap().journal.installation.clone();
+        let salt = {
+            let inner = app.notifications.inner.lock();
+            let store = inner.store.as_ref().unwrap();
+            if capture_resumed {
+                resumed = store.journal.pending.iter().map(|pending| pending.event.id.clone()).collect();
+                capture_resumed = false;
+            }
+            store.journal.installation.clone()
+        };
         let accounts: Vec<_> = app.pool.all().into_iter().filter(|a| native(a)).collect();
         let mut present = BTreeSet::new();
         let mut enabled = BTreeSet::new();
@@ -513,7 +617,19 @@ pub async fn worker(app: Arc<App>) {
             let key = format!("{}:{}", acct.id, id);
             let mut st = acct.state.lock();
             if st.disabled {
-                ready.remove(&id);
+                fresh.remove(&id);
+                let inner = app.notifications.inner.lock();
+                resumed.extend(
+                    inner
+                        .store
+                        .as_ref()
+                        .unwrap()
+                        .journal
+                        .pending
+                        .iter()
+                        .filter(|pending| pending.event.subscription == id)
+                        .map(|pending| pending.event.id.clone()),
+                );
                 fresh_after.insert(id, Utc::now());
                 continue;
             }
@@ -521,7 +637,7 @@ pub async fn worker(app: Arc<App>) {
             let latest = st.notification_evidence.sequence;
             if seen.get(&key).is_some_and(|previous| *previous > latest) {
                 seen.remove(&key);
-                ready.remove(&id);
+                fresh.remove(&id);
             }
             let observations: Vec<_> = st
                 .notification_evidence
@@ -530,7 +646,7 @@ pub async fn worker(app: Arc<App>) {
                 .filter(|o| o.sequence > *seen.get(&key).unwrap_or(&0))
                 .cloned()
                 .collect();
-            let after = *fresh_after.get(&id).unwrap_or(&enabled_since);
+            let after = fresh_after.get(&id).copied().unwrap_or(enabled_since).max(enabled_since);
             let confirmation_needed = {
                 let inner = app.notifications.inner.lock();
                 inner.store.as_ref().and_then(|s| s.journal.subscriptions.get(&id)).is_some_and(|s| {
@@ -540,10 +656,14 @@ pub async fn worker(app: Arc<App>) {
                     })
                 })
             };
-            if observations.iter().any(|o| o.at >= after) {
-                ready.insert(id.clone());
-            }
-            if !ready.contains(&id) || st.notification_evidence.overflow || confirmation_needed {
+            let complete =
+                {
+                    let inner = app.notifications.inner.lock();
+                    inner.store.as_ref().and_then(|store| store.journal.subscriptions.get(&id)).is_some_and(
+                        |subscription| fresh.get(&id).is_some_and(|evidence| evidence.complete(subscription)),
+                    )
+                };
+            if !complete || st.notification_evidence.overflow || confirmation_needed {
                 st.quota.refreshed_at = None;
             }
             snapshots.push((
@@ -557,7 +677,7 @@ pub async fn worker(app: Arc<App>) {
             sources.insert(key, acct.clone());
         }
         seen.retain(|key, _| sources.contains_key(key));
-        ready.retain(|id| present.contains(id));
+        fresh.retain(|id, _| present.contains(id));
         fresh_after.retain(|id, _| present.contains(id));
         let mut acknowledged = Vec::new();
         let jobs = {
@@ -567,6 +687,7 @@ pub async fn worker(app: Arc<App>) {
             }
             let store = inner.store.as_mut().unwrap();
             let before = store.journal.clone();
+            let mut next_fresh = fresh.clone();
             let mut capacity = false;
             let old_subs = store.journal.subscriptions.len();
             let old_pending = store.journal.pending.len();
@@ -593,6 +714,7 @@ pub async fn worker(app: Arc<App>) {
                 let mut events = Vec::new();
                 for observation in observations.iter().filter(|o| o.at >= *after) {
                     events.extend(subscription.apply(id, observation));
+                    next_fresh.entry(id.clone()).or_default().record(subscription, observation);
                     dirty = true;
                 }
                 for event in events {
@@ -619,10 +741,12 @@ pub async fn worker(app: Arc<App>) {
                             .values()
                             .any(|w| w.exhausted && w.name == p.event.window && w.model == p.event.model),
                         "quota.available" => s.windows.values().any(|w| w.exhausted),
-                        "quota.window_recovered" => s
-                            .windows
-                            .values()
-                            .any(|w| w.exhausted && w.name == p.event.window && w.model == p.event.model),
+                        "quota.window_recovered" => {
+                            s.windows
+                                .values()
+                                .any(|w| w.exhausted && w.name == p.event.window && w.model == p.event.model)
+                                || blockers(s) != p.event.remaining_blockers
+                        }
                         _ => false,
                     }
                 });
@@ -655,6 +779,7 @@ pub async fn worker(app: Arc<App>) {
             } else {
                 Ok(())
             };
+            let reconciled = persistence.is_ok();
             if let Err(error) = persistence {
                 store.journal = before;
                 inner.error = Some(error);
@@ -665,10 +790,14 @@ pub async fn worker(app: Arc<App>) {
                         acknowledged.push((account.clone(), last.sequence));
                     }
                 }
+                fresh = next_fresh;
                 inner.error = None;
             }
             // Existing durable jobs may drain even while new observations exceed capacity.
             let store = inner.store.as_ref().unwrap();
+            let pending_ids: BTreeSet<_> =
+                store.journal.pending.iter().map(|pending| pending.event.id.clone()).collect();
+            resumed.retain(|id| pending_ids.contains(id));
             let mut blocked = BTreeSet::new();
             let mut jobs = Vec::new();
             for p in &store.journal.pending {
@@ -680,7 +809,13 @@ pub async fn worker(app: Arc<App>) {
                 }
                 if p.next <= Utc::now()
                     && enabled.contains(&p.event.subscription)
-                    && ready.contains(&p.event.subscription)
+                    // Never claim recovery against state rolled back after failed reconciliation.
+                    && (reconciled || p.event.event == "quota.exhausted")
+                    && store.journal.subscriptions.get(&p.event.subscription).is_some_and(|subscription| {
+                        fresh.get(&p.event.subscription).is_some_and(|evidence| {
+                            evidence.permits(&p.event, subscription, resumed.contains(&p.event.id))
+                        })
+                    })
                     && let Some(destination) =
                         cfg.notifications.destinations.iter().find(|d| d.id == p.destination && d.enabled)
                 {
@@ -960,6 +1095,221 @@ mod tests {
         let task = tokio::spawn(worker(app.clone()));
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert!(!temp.0.join(".quota-notifications").exists());
+        task.abort();
+        let _ = task.await;
+    }
+    fn sample(name: &str, used: f64) -> crate::quota::Window {
+        crate::quota::Window { name: name.into(), used, resets_at: None, model: None }
+    }
+    fn seed_pending(app: &App, acct: &Account, kind: &str) -> String {
+        app.notifications.open().unwrap();
+        let mut inner = app.notifications.inner.lock();
+        let store = inner.store.as_mut().unwrap();
+        let id = identity(acct, &store.journal.installation);
+        let mut subscription = Subscription { provider: "claude".into(), ..Default::default() };
+        let old = Utc::now() - chrono::Duration::minutes(5);
+        let observation = state::Observation {
+            sequence: 1,
+            at: old,
+            windows: vec![sample("5h", 100.0), sample("week", 100.0)],
+            authoritative: true,
+            unknown: None,
+        };
+        let exhausted = subscription.apply(&id, &observation);
+        let observation = state::Observation {
+            sequence: 2,
+            at: old + chrono::Duration::seconds(1),
+            windows: if kind == "quota.window_recovered" {
+                vec![sample("5h", 0.0)]
+            } else {
+                vec![sample("5h", 0.0), sample("week", 0.0)]
+            },
+            authoritative: true,
+            unknown: None,
+        };
+        let event = if kind == "quota.exhausted" {
+            exhausted.into_iter().find(|event| event.window == "5h").unwrap()
+        } else {
+            subscription.apply(&id, &observation).into_iter().find(|event| event.event == kind).unwrap()
+        };
+        store.journal.subscriptions.insert(id.clone(), subscription);
+        store.journal.pending.push_back(Pending {
+            destination: app.cfg().notifications.destinations[0].id.clone(),
+            event,
+            attempt: 0,
+            next: Utc::now(),
+        });
+        store.save().unwrap();
+        id
+    }
+    async fn consumed(app: &App, acct: &Account) {
+        tokio::time::timeout(Duration::from_secs(6), async {
+            while !acct.state.lock().notification_evidence.observations.is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Missing credentials finish immediately without DNS or an outbound connection.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(app.notifications.status(app)["error"].is_null());
+    }
+    fn assert_waiting(app: &App) {
+        let status = app.notifications.status(app);
+        assert_eq!(status["pending"], 1);
+        assert!(status["logs"].as_array().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn persisted_available_after_restart_waits_for_all_fresh_authoritative_windows() {
+        let (temp, app, acct) = fixture(true);
+        seed_pending(&app, &acct, "quota.available");
+        let cfg = (*app.cfg()).clone();
+        drop(acct);
+        drop(app);
+        // A new App opens the actual persisted journal and starts a new worker.
+        let app = App::new(cfg, temp.0.join("config.yaml"));
+        let acct = app.pool.all()[0].clone();
+        let task = tokio::spawn(worker(app.clone()));
+        acct.state.lock().notification_evidence.observe(&[sample("5h", 10.0)], false);
+        consumed(&app, &acct).await;
+        assert_waiting(&app);
+        assert!(acct.state.lock().quota.refreshed_at.is_none());
+        crate::quota::authoritative(&mut acct.state.lock(), vec![sample("5h", 10.0)], None);
+        consumed(&app, &acct).await;
+        assert_waiting(&app);
+        crate::quota::authoritative(&mut acct.state.lock(), vec![sample("5h", 10.0), sample("week", 20.0)], None);
+        until_logs(&app, 1).await;
+        let status = app.notifications.status(&app);
+        assert_eq!(status["logs"][0]["event"], "quota.available");
+        assert_eq!(status["logs"][0]["detail"], "credential_unavailable");
+        assert_eq!(status["pending"], 0);
+        task.abort();
+        let _ = task.await;
+    }
+    #[tokio::test]
+    async fn reenabled_pending_recovery_discards_pre_pause_confirmation() {
+        let (_temp, app, acct) = fixture(true);
+        seed_pending(&app, &acct, "quota.available");
+        let task = tokio::spawn(worker(app.clone()));
+        crate::quota::authoritative(&mut acct.state.lock(), vec![sample("5h", 10.0)], None);
+        consumed(&app, &acct).await;
+        assert_waiting(&app);
+        let mut cfg = (*app.cfg()).clone();
+        cfg.notifications.enabled = false;
+        app.set_config(cfg);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let mut cfg = (*app.cfg()).clone();
+        cfg.notifications.enabled = true;
+        app.set_config(cfg);
+        // Week confirmation alone must not combine with the old pre-pause 5h read.
+        crate::quota::authoritative(&mut acct.state.lock(), vec![sample("week", 20.0)], None);
+        consumed(&app, &acct).await;
+        assert_waiting(&app);
+        crate::quota::authoritative(&mut acct.state.lock(), vec![sample("5h", 10.0), sample("week", 20.0)], None);
+        until_logs(&app, 1).await;
+        assert_eq!(app.notifications.status(&app)["logs"][0]["event"], "quota.available");
+        task.abort();
+        let _ = task.await;
+    }
+    #[tokio::test]
+    async fn persisted_partial_recovery_waits_but_current_partial_recovery_dispatches() {
+        let (_temp, app, acct) = fixture(true);
+        seed_pending(&app, &acct, "quota.window_recovered");
+        let task = tokio::spawn(worker(app.clone()));
+        crate::quota::authoritative(&mut acct.state.lock(), vec![sample("5h", 10.0)], None);
+        consumed(&app, &acct).await;
+        assert_waiting(&app);
+        crate::quota::authoritative(&mut acct.state.lock(), vec![sample("week", 100.0)], None);
+        until_logs(&app, 1).await;
+        assert_eq!(app.notifications.status(&app)["logs"][0]["event"], "quota.window_recovered");
+        task.abort();
+        let _ = task.await;
+
+        let (_temp, app, acct) = fixture(true);
+        let task = tokio::spawn(worker(app.clone()));
+        crate::quota::authoritative(&mut acct.state.lock(), vec![sample("5h", 100.0), sample("week", 100.0)], None);
+        until_logs(&app, 2).await;
+        crate::quota::authoritative(&mut acct.state.lock(), vec![sample("5h", 10.0)], None);
+        until_logs(&app, 3).await;
+        let status = app.notifications.status(&app);
+        assert_eq!(status["logs"][2]["event"], "quota.window_recovered");
+        {
+            let inner = app.notifications.inner.lock();
+            assert!(
+                inner
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .journal
+                    .subscriptions
+                    .values()
+                    .next()
+                    .unwrap()
+                    .windows
+                    .values()
+                    .any(|window| window.name == "week" && window.exhausted)
+            );
+        }
+        task.abort();
+        let _ = task.await;
+    }
+    #[tokio::test]
+    async fn persisted_exhaustion_requires_fresh_matching_blocking_window() {
+        let (_temp, app, acct) = fixture(true);
+        seed_pending(&app, &acct, "quota.exhausted");
+        let task = tokio::spawn(worker(app.clone()));
+        acct.state.lock().notification_evidence.observe(&[sample("week", 20.0)], false);
+        consumed(&app, &acct).await;
+        assert_waiting(&app);
+        acct.state.lock().notification_evidence.observe(&[sample("5h", 100.0)], false);
+        until_logs(&app, 1).await;
+        assert_eq!(app.notifications.status(&app)["logs"][0]["event"], "quota.exhausted");
+        task.abort();
+        let _ = task.await;
+    }
+    #[test]
+    fn unknown_recovery_confirmation_covers_shared_and_learned_model_windows() {
+        let mut subscription = Subscription { provider: "claude".into(), ..Default::default() };
+        let mut observation = state::Observation {
+            sequence: 1,
+            at: Utc::now(),
+            windows: Vec::new(),
+            authoritative: false,
+            unknown: Some("*".into()),
+        };
+        subscription.apply("id", &observation);
+        let opus = crate::quota::Window { model: Some("opus".into()), ..sample("week opus", 0.0) };
+        observation.unknown = None;
+        observation.authoritative = true;
+        observation.windows = vec![sample("5h", 0.0), sample("week", 0.0), opus.clone()];
+        observation.at = Utc::now();
+        let event = subscription.apply("id", &observation).pop().unwrap();
+        assert_eq!(event.event, "quota.available");
+        let mut fresh = FreshEvidence::default();
+        observation.windows.pop();
+        observation.at = Utc::now();
+        fresh.record(&subscription, &observation);
+        assert!(!fresh.permits(&event, &subscription, true));
+        observation.windows.push(opus);
+        observation.at = Utc::now();
+        fresh.record(&subscription, &observation);
+        assert!(fresh.permits(&event, &subscription, true));
+    }
+    #[tokio::test]
+    async fn resumed_partial_recovery_with_changed_blockers_is_cancelled() {
+        let (_temp, app, acct) = fixture(true);
+        seed_pending(&app, &acct, "quota.window_recovered");
+        let task = tokio::spawn(worker(app.clone()));
+        crate::quota::authoritative(&mut acct.state.lock(), vec![sample("5h", 10.0)], None);
+        consumed(&app, &acct).await;
+        assert_waiting(&app);
+        crate::quota::authoritative(&mut acct.state.lock(), vec![sample("5h", 10.0), sample("week", 20.0)], None);
+        until_logs(&app, 2).await;
+        let status = app.notifications.status(&app);
+        assert_eq!(status["logs"][0]["event"], "quota.window_recovered");
+        assert_eq!(status["logs"][0]["outcome"], "cancelled");
+        assert_eq!(status["logs"][1]["event"], "quota.available");
+        assert_eq!(status["logs"][1]["detail"], "credential_unavailable");
         task.abort();
         let _ = task.await;
     }

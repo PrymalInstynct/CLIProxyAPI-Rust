@@ -189,6 +189,177 @@ async fn managed_credentials_save_replace_clear_reload_and_delete_without_leakin
     assert!(!credential_path.exists());
 }
 
+async fn put_raw_config(client: &reqwest::Client, origin: &str, cfg: &crate::config::Config) -> reqwest::Response {
+    let text = serde_yaml::to_string(cfg).unwrap();
+    authenticated(client, reqwest::Method::PUT, &format!("{origin}/api/config"), origin)
+        .json(&json!({"text": text}))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn patch_destinations(client: &reqwest::Client, origin: &str, destinations: Value) -> reqwest::Response {
+    let settings: Value = client
+        .get(format!("{origin}/api/config/settings"))
+        .bearer_auth(KEY)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    authenticated(client, reqwest::Method::PATCH, &format!("{origin}/api/config/settings"), origin)
+        .json(&json!({
+            "revision": settings["revision"],
+            "changes": {"notifications": {"destinations": destinations}}
+        }))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn saved_credentials_block_raw_config_delete_and_rename_until_removed() {
+    let temp = Temp::new();
+    let current_app = app(&temp, None);
+    let (origin, _server) = serve(current_app.clone()).await;
+    let client = reqwest::Client::new();
+    let route = credential_route(&origin, "ops");
+    let sentinel = "lifecycle-credential-sentinel";
+    let saved = authenticated(&client, reqwest::Method::PUT, &route, &origin)
+        .json(&json!({"url":"https://hooks.example.invalid/lifecycle", "bearer_token":sentinel}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), StatusCode::OK);
+    let before = std::fs::read(&current_app.cfg_path).unwrap();
+    let expected = "Remove saved notification credentials before deleting or renaming a destination.";
+
+    for replacement_id in [None, Some("renamed")] {
+        let mut changed = (*current_app.cfg()).clone();
+        if let Some(id) = replacement_id {
+            changed.notifications.destinations[0].id = id.to_owned();
+        } else {
+            changed.notifications.destinations.clear();
+        }
+        let response = put_raw_config(&client, &origin, &changed).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.text().await.unwrap();
+        assert!(body.contains(expected));
+        assert!(!body.contains(sentinel));
+        assert_eq!(
+            std::fs::read(&current_app.cfg_path).unwrap(),
+            before,
+            "rejected raw config must leave disk unchanged"
+        );
+    }
+
+    let deleted = authenticated(&client, reqwest::Method::DELETE, &route, &origin).send().await.unwrap();
+    assert_eq!(deleted.status(), StatusCode::OK);
+    let mut removed = (*current_app.cfg()).clone();
+    removed.notifications.destinations.clear();
+    assert_eq!(put_raw_config(&client, &origin, &removed).await.status(), StatusCode::OK);
+    let mut reused = (*current_app.cfg()).clone();
+    reused.notifications.destinations.push(crate::notifications::Destination {
+        id: "ops".into(),
+        format: crate::notifications::Format::Discord,
+        enabled: true,
+        chat_id: None,
+    });
+    assert_eq!(put_raw_config(&client, &origin, &reused).await.status(), StatusCode::OK);
+    let status: Value =
+        client.get(format!("{origin}/api/notifications")).bearer_auth(KEY).send().await.unwrap().json().await.unwrap();
+    assert_eq!(status["destinations"][0]["credential_source"], "none");
+}
+
+#[tokio::test]
+async fn managed_credentials_block_structured_destination_changes_but_removal_unblocks_patch() {
+    let temp = Temp::new();
+    let current_app = app(&temp, None);
+    let (origin, _server) = serve(current_app.clone()).await;
+    let client = reqwest::Client::new();
+    let route = credential_route(&origin, "ops");
+    let sentinel = "patch-lifecycle-secret-sentinel";
+    assert_eq!(
+        authenticated(&client, reqwest::Method::PUT, &route, &origin)
+            .json(&json!({"url":"https://hooks.example.invalid/patch", "bearer_token":sentinel}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let before = std::fs::read(&current_app.cfg_path).unwrap();
+    for destinations in [json!([]), json!([{"id":"renamed","format":"discord","enabled":true}])] {
+        let response = patch_destinations(&client, &origin, destinations).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("Remove saved notification credentials before deleting or renaming a destination."));
+        assert!(!body.contains(sentinel));
+        assert_eq!(std::fs::read(&current_app.cfg_path).unwrap(), before);
+    }
+    assert_eq!(
+        authenticated(&client, reqwest::Method::DELETE, &route, &origin).send().await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert!(patch_destinations(&client, &origin, json!([])).await.status().is_success());
+}
+
+#[tokio::test]
+async fn orphaned_managed_credentials_block_id_reuse_until_deleted_but_external_only_does_not() {
+    let temp = Temp::new();
+    let current_app = app(&temp, None);
+    let (origin, _server) = serve(current_app.clone()).await;
+    let client = reqwest::Client::new();
+    let creds_dir = temp.0.join("auth/.notification-credentials");
+    std::fs::create_dir_all(&creds_dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&creds_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    private_file(
+        &creds_dir.join("reserved.json"),
+        r#"{"url":"https://hooks.example.invalid/orphan","bearer_token":"orphan-secret-sentinel"}"#,
+    );
+    let mut cfg = (*current_app.cfg()).clone();
+    cfg.notifications.destinations.push(crate::notifications::Destination {
+        id: "reserved".into(),
+        format: crate::notifications::Format::Discord,
+        enabled: true,
+        chat_id: None,
+    });
+    let config_before = std::fs::read(&current_app.cfg_path).unwrap();
+    let response = put_raw_config(&client, &origin, &cfg).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("This destination ID already has saved credentials. Remove them before reusing the ID."));
+    assert!(!body.contains("orphan-secret-sentinel"));
+    assert_eq!(std::fs::read(&current_app.cfg_path).unwrap(), config_before);
+
+    let removed = authenticated(&client, reqwest::Method::DELETE, &credential_route(&origin, "reserved"), &origin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), StatusCode::OK);
+    assert_eq!(put_raw_config(&client, &origin, &cfg).await.status(), StatusCode::OK);
+
+    let external_temp = Temp::new();
+    let external_dir = external_temp.0.join("external");
+    std::fs::create_dir_all(&external_dir).unwrap();
+    let external_path = external_dir.join("ops.json");
+    private_file(
+        &external_path,
+        r#"{"url":"https://hooks.example.invalid/external","bearer_token":"external-secret"}"#,
+    );
+    let external_app = app(&external_temp, Some(&external_dir));
+    let (external_origin, _external_server) = serve(external_app.clone()).await;
+    let mut external_cfg = (*external_app.cfg()).clone();
+    external_cfg.notifications.destinations.clear();
+    assert_eq!(put_raw_config(&client, &external_origin, &external_cfg).await.status(), StatusCode::OK);
+    assert!(external_path.exists(), "removing a destination must not alter externally managed credentials");
+}
+
 #[tokio::test]
 async fn managed_credential_api_requires_bearer_auth_and_rejects_origin_and_forwarded_header_spoofing() {
     let temp = Temp::new();

@@ -25,7 +25,7 @@ notifications:
   private-endpoints:
     - host: chat.example.net
       port: 443
-      cidrs: [10.1.2.3/32]
+      cidrs: [10.1.2.3/32] # webhook destination address
   destinations:
     - id: ops-discord
       format: discord
@@ -41,7 +41,7 @@ The dashboard lets you enable or disable notifications and individual destinatio
 
 The public URL must match the browser's request origin for credential changes. The dashboard also requires HTTPS and same-origin access, and uses the management bearer header when a management key is configured. These checks do not attest that a reverse proxy really terminates TLS. As the deployment administrator, ensure the public endpoint uses valid HTTPS and that the proxy does not expose an insecure route to the dashboard or API. Direct localhost access and native server TLS can use a blank public URL.
 
-After enabling secret entry, first save the destination, then choose **Add credentials** (or **Replace credentials**) and use **Save credentials**. Saving replaces the complete bundle; an empty bearer field clears any previous token. **Remove credentials** requires inline confirmation (**Remove** or **Keep credentials**). After a save request is sent, the password fields clear even if the server rejects it. Values are never returned to the browser, kept in browser storage, written to YAML, or logged. **Send test** makes one delivery attempt and reports its result; it may take up to 20 seconds and is limited to one attempt per destination every 30 seconds. The test previews both bundled provider logos. Status shows safe categories and HTTP status codes. It does not expose webhook URLs, tokens, remote response bodies, or raw network errors. Activity is sorted newest first, refreshes every five seconds while the section is open, and can be filtered by destination.
+After enabling secret entry, first save the destination, then choose **Add credentials** (or **Replace credentials**) and use **Save credentials**. Saving replaces the complete bundle; an empty bearer field clears any previous token. Remove managed credentials before deleting a destination or changing its ID; the dashboard locks these actions while credentials remain, and configuration saves and hot reload reject unsafe changes. Removing a destination never deletes externally provisioned files or environment variables. **Remove credentials** requires inline confirmation (**Remove** or **Keep credentials**). After a save request is sent, the password fields clear even if the server rejects it. Values are never returned to the browser, kept in browser storage, written to YAML, or logged. **Send test** makes one delivery attempt and reports its result; it may take up to 20 seconds and is limited to one attempt per destination every 30 seconds. The test previews both bundled provider logos. Status shows safe categories and HTTP status codes. It does not expose webhook URLs, tokens, remote response bodies, or raw network errors. Activity is sorted newest first, refreshes every five seconds while the section is open, and can be filtered by destination.
 
 The dashboard labels credentials **Configured**, **Externally managed**, or **Not configured**. The status API uses `credential_source` (`managed`, `external`, or `none`) and the booleans `credential_configured`, `credential_ready`, and `credential_editable`. The dashboard can write only `managed` credentials. Environment variables and manually provisioned secret files remain supported as `external` credentials and are read-only in the UI. An external source is authoritative: if it is malformed or unavailable, the proxy reports it as not ready and does not silently fall back to a managed copy.
 
@@ -70,7 +70,7 @@ Managed credential bundles are stored as plaintext JSON at `auth-dir/.notificati
 
 Managed credential writes are supported on Unix systems with these file permissions. On Windows, writes fail closed because equivalent ACL protection is not implemented; use the environment-variable or external secret-file methods below.
 
-The credential API accepts only a valid saved destination ID. `PUT /api/notifications/{id}/credentials` replaces the complete URL/token bundle; `DELETE /api/notifications/{id}/credentials` removes it and takes no body. PUT accepts same-origin JSON up to 20 KiB and returns only safe status. Its JSON fields are `url` and optional `bearer_token`; an empty or omitted token clears the prior token. Use the normal management `Authorization: Bearer` header when a management key is configured; query-string keys are not accepted. For example, use placeholders and a protected input method rather than putting real credentials in shell history:
+Credential saves accept only a valid saved destination ID. Credential deletion also accepts a valid fixed ID without a configured destination so an administrator can remove an orphaned managed bundle left by an offline YAML edit. New destinations cannot reuse an orphaned managed credential ID until that bundle is removed. Clean up managed credentials before offline deletion or renaming; the server cannot infer an old configuration when starting from an already-edited YAML file. `PUT /api/notifications/{id}/credentials` replaces the complete URL/token bundle; `DELETE /api/notifications/{id}/credentials` removes it and takes no body. PUT accepts same-origin JSON up to 20 KiB and returns only safe status. Its JSON fields are `url` and optional `bearer_token`; an empty or omitted token clears the prior token. Use the normal management `Authorization: Bearer` header when a management key is configured; query-string keys are not accepted. For example, use placeholders and a protected input method rather than putting real credentials in shell history:
 
 ```json
 {"url":"https://webhook.example/REDACTED","bearer_token":"REDACTED"}
@@ -87,7 +87,7 @@ Example for an advanced reverse-proxy compatibility setup:
 ```yaml
 notifications:
   credential-proxy-cidrs:
-    - 10.1.2.3/32
+    - 192.0.2.10/32 # reverse-proxy peer address
 ```
 
 Configure only the actual proxy peer address. The CIDR does not describe the webhook server or the clients reaching the proxy.
@@ -148,7 +148,7 @@ Delivery uses HTTPS with certificate validation. To trust an internal certificat
 
 The durable event and delivery journal contain no account display name, email, OAuth token, credential filename, provider response, request body, webhook URL or secret. The subscription ID is opaque and local to this installation. The live status response resolves a current display name for delivery activity without persisting it. Delivery records persist the sanitized credential-free event and destination IDs in the auth directory. Protect and back up that directory as application state; do not expose it as a public volume. Secret file contents are resolved for delivery and are not written to the notification journal or management responses.
 
-The worker persists transitions and pending deliveries before sending, then retries temporary failures with bounded backoff (up to eight attempts). Pending events expire after 48 hours. A destination outage does not block proxy requests or deliveries to other destinations. Retried messages may arrive late and can be duplicated; terminal failures remain visible in delivery status for operator action. Disabling a destination pauses its pending deliveries; removing it discards them. Disabling a subscription also pauses delivery; re-enabling it waits for fresh quota confirmation before delivery resumes. Keep a single active instance using a given auth directory for notification monitoring and delivery.
+The worker persists transitions and pending deliveries before sending, then retries temporary failures with bounded backoff (up to eight attempts). Pending events expire after 48 hours. A destination outage does not block proxy requests or deliveries to other destinations. Retried messages may arrive late and can be duplicated; terminal failures remain visible in delivery status for operator action. Disabling a destination pauses its pending deliveries; removing it discards them. Disabling a subscription also pauses delivery; re-enabling it waits for fresh quota confirmation before delivery resumes. Persisted recovery messages wait for authoritative confirmation covering all previously learned relevant windows; partial request headers cannot release an old availability message. Fresh exhaustion can still be reported immediately. Delayed quota errors from requests started before newer provider usage, a quota reset, or a disable/re-enable cycle cannot restore an obsolete exhausted state. Recovery delivery pauses if state reconciliation cannot be persisted. Keep a single active instance using a given auth directory for notification monitoring and delivery.
 
 ## Troubleshooting
 
