@@ -262,6 +262,7 @@ banked-resets: false        # show and spend banked Claude/ChatGPT limit resets 
 notifications:
   enabled: false            # configure destinations under Config → Notifications
   time-zone: UTC            # IANA time zone for message timestamps; e.g. America/Denver
+  provider-logos: true      # bundled logo thumbnails for Discord alerts
   destinations: []          # webhook credentials come from private files or designated environment variables
 debug: false
 

@@ -34,6 +34,7 @@ fn https_port() -> u16 {
 pub struct Config {
     pub enabled: bool,
     pub time_zone: String,
+    pub provider_logos: bool,
     pub secrets_dir: Option<String>,
     pub ca_file: Option<String>,
     pub private_endpoints: Vec<PrivateEndpoint>,
@@ -44,6 +45,7 @@ impl Default for Config {
         Self {
             enabled: false,
             time_zone: "UTC".into(),
+            provider_logos: true,
             secrets_dir: None,
             ca_file: None,
             private_endpoints: Vec::new(),
@@ -272,7 +274,9 @@ impl Service {
             used: None,
             remaining_blockers: Vec::new(),
         };
-        let presentation = delivery::Presentation::new(None, time_zone(&app.cfg().notifications));
+        let notification_config = app.cfg();
+        let presentation = delivery::Presentation::new(None, time_zone(&notification_config.notifications))
+            .with_provider_logos(notification_config.notifications.provider_logos);
         let outcome =
             delivery::send(&self.secrets, &self.private_endpoints, self.ca_file.as_deref(), &d, &event, &presentation)
                 .await;
@@ -574,7 +578,8 @@ pub async fn worker(app: Arc<App>) {
                     {
                         let salt = service.inner.lock().store.as_ref().unwrap().journal.installation.clone();
                         let name = display_name(&app, &p.event.subscription, &salt);
-                        let presentation = delivery::Presentation::new(name.as_deref(), time_zone(&live.notifications));
+                        let presentation = delivery::Presentation::new(name.as_deref(), time_zone(&live.notifications))
+                            .with_provider_logos(live.notifications.provider_logos);
                         delivery::send(
                             &service.secrets,
                             &service.private_endpoints,

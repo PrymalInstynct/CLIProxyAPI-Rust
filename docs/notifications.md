@@ -14,6 +14,7 @@ The corresponding configuration is:
 notifications:
   enabled: true
   time-zone: America/Denver # notification timestamps; IANA time zone
+  provider-logos: true # Discord-only provider logo thumbnails; default true
   # Optional. Defaults to <auth-dir>/.notification-secrets.
   secrets-dir: /run/notification-secrets
   # Optional startup-only PEM CA bundle for private HTTPS services.
@@ -34,7 +35,7 @@ notifications:
 
 Destination IDs are unique lowercase names of up to 32 characters using `a-z`, `0-9` and hyphens; do not start or end an ID with a hyphen. You can configure at most eight destinations. Supported formats are `generic`, `discord`, `slack`, `mattermost`, `teams` and `telegram`. Telegram requires a `chat-id`. Keep the ID stable when rotating credentials so queued retries remain associated with the destination.
 
-The dashboard lets you enable or disable notifications and individual destinations, edit destination IDs and formats, set Telegram chat IDs, and inspect a safe delivery log. **Send test** makes one delivery attempt and reports its result; it may take up to 20 seconds and is limited to one attempt per destination every 30 seconds. Status shows safe categories and HTTP status codes. It does not expose webhook URLs, tokens, remote response bodies, or raw network errors. Activity refreshes every five seconds while the section is open and can be filtered by destination.
+The dashboard lets you enable or disable notifications and individual destinations, edit destination IDs and formats, set Telegram chat IDs, toggle Discord **Provider logos**, and inspect a safe delivery log. **Send test** makes one delivery attempt and reports its result; it may take up to 20 seconds and is limited to one attempt per destination every 30 seconds. The test previews both bundled provider logos. Status shows safe categories and HTTP status codes. It does not expose webhook URLs, tokens, remote response bodies, or raw network errors. Activity refreshes every five seconds while the section is open and can be filtered by destination.
 
 ## Names and time zones
 
@@ -99,7 +100,7 @@ Environment values are inherited when the process starts. Avoid putting them dir
 ## Create service webhooks
 
 - **Generic:** point the destination URL at an HTTPS endpoint that accepts a versioned JSON event body. Optional bearer authentication uses the `.bearer` file or matching environment variable. The event includes an event ID, provider, opaque subscription ID, event type, scope, observed usage and estimated reset time when known. Build a receiver that accepts duplicate event IDs: delivery is at least once, and a timeout after remote acceptance can cause a retry.
-- **Discord:** create an incoming webhook and use its generated URL as the secret. Messages disable allowed mentions. See [Discord webhook documentation](https://docs.discord.com/developers/resources/webhook).
+- **Discord:** create an incoming webhook and use its generated URL as the secret. Messages disable allowed mentions. When **Provider logos** is enabled (the default), the alert keeps its normal message content and adds a bundled 128×128 provider logo attachment displayed as a thumbnail with the provider label and color; no public image host is used. The webhook avatar stays unchanged, so the post remains clearly a proxy notification. This toggle affects Discord only; other destinations keep their existing payload formats. See [Discord webhook documentation](https://docs.discord.com/developers/resources/webhook) and Discord's [file upload and embed reference](https://docs.discord.com/developers/reference#uploading-files).
 - **Slack:** create an incoming webhook for the target channel and store its generated URL as the secret. See [Slack incoming webhooks](https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks/).
 - **Mattermost:** create an incoming webhook for the target channel and store its generated URL as the secret. See [Mattermost incoming webhooks](https://docs.mattermost.com/integrations-guide/incoming-webhooks).
 - **Teams:** create a Teams **Workflows** incoming webhook that accepts an Adaptive Card, then store its generated URL as the secret. Prefer a workflow owned by a service account so it remains available when a person leaves. See Microsoft's [incoming webhook workflow setup](https://support.microsoft.com/en-us/workflows/send-messages-in-teams-using-incoming-webhooks). Legacy Office 365 connector webhooks are not the supported setup.
@@ -121,6 +122,7 @@ The worker persists transitions and pending deliveries before sending, then retr
 | No recovery message after a reset time | The displayed provider reset is an estimate. Recovery waits for a successful fresh usage response that explicitly reports headroom; provider outages or missing windows keep the state unconfirmed. |
 | Notifications are delayed | Idle subscriptions use periodic usage polling; provider errors back off. Check destination delivery status for queued retries or a terminal error. |
 | Test delivery fails | Check the destination URL, secret file/env mapping, file ownership/mode, and destination's webhook configuration. For private endpoints, verify the exact host, port and CIDR allow rule. The UI intentionally omits remote response bodies and secret URLs. |
+| Discord provider thumbnail missing | Confirm **Provider logos** is enabled and run a test, which previews both provider logos. Check Discord's [file upload and embed reference](https://docs.discord.com/developers/reference#uploading-files) for attachment thumbnail behavior. |
 | TLS certificate verification fails | Check that the server name matches the webhook URL and the certificate chain is valid. For an internal CA, configure `notifications.ca-file` with a PEM bundle and restart after changing the setting. TLS verification stays enabled. |
 | Secret changes have no effect | Check the exact environment variable name or `<id>.url`/`<id>.bearer` filename, then inspect credential readiness and delivery status. Environment variables require a process restart after rotation. |
 | Duplicate message | Webhook delivery is at least once. A remote endpoint may accept a request immediately before the proxy loses its acknowledgement; generic receivers can deduplicate by event ID. |

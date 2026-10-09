@@ -1,6 +1,6 @@
 //! Isolated webhook transport. No OAuth headers, ambient proxies, redirects or raw error logging.
 use super::{Destination, Format, PrivateEndpoint, state::Event, store::safe_file};
-use reqwest::header::{AUTHORIZATION, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use serde_json::{Value, json};
 use std::{
     io::Read,
@@ -92,10 +92,15 @@ impl Outcome {
 pub struct Presentation {
     display_name: Option<String>,
     time_zone: chrono_tz::Tz,
+    provider_logos: bool,
 }
 impl Presentation {
     pub fn new(name: Option<&str>, time_zone: chrono_tz::Tz) -> Self {
-        Self { display_name: name.map(safe_name), time_zone }
+        Self { display_name: name.map(safe_name), time_zone, provider_logos: true }
+    }
+    pub fn with_provider_logos(mut self, enabled: bool) -> Self {
+        self.provider_logos = enabled;
+        self
     }
     fn local(&self, at: chrono::DateTime<chrono::Utc>) -> String {
         at.with_timezone(&self.time_zone).format("%Y-%m-%d %H:%M:%S %Z (%:z)").to_string()
@@ -184,7 +189,15 @@ pub fn payload(d: &Destination, e: &Event, presentation: &Presentation) -> Value
                 json!(e.resets_at.map(|at| at.with_timezone(&presentation.time_zone).to_rfc3339()));
             value
         }
-        Format::Discord => json!({"content":text,"allowed_mentions":{"parse":[]}}),
+        Format::Discord => {
+            let mut value = json!({"content":text,"allowed_mentions":{"parse":[]}});
+            let logos = logos(d, e, presentation);
+            if !logos.is_empty() {
+                value["embeds"]=json!(logos.iter().map(|logo|json!({"title":if e.event=="notification.test"{format!("{} logo preview",logo.title)}else{logo.title.into()},"color":logo.color,"thumbnail":{"url":format!("attachment://{}",logo.filename)}})).collect::<Vec<_>>());
+                value["attachments"]=json!(logos.iter().enumerate().map(|(id,logo)|json!({"id":id,"filename":logo.filename,"description":format!("{} logo",logo.title)})).collect::<Vec<_>>());
+            }
+            value
+        }
         Format::Slack => {
             json!({"text":text,"mrkdwn":false,"link_names":false,"unfurl_links":false,"unfurl_media":false})
         }
@@ -194,6 +207,58 @@ pub fn payload(d: &Destination, e: &Event, presentation: &Presentation) -> Value
         }
         Format::Telegram => json!({"chat_id":d.chat_id,"text":text,"disable_web_page_preview":true}),
     }
+}
+struct Logo {
+    filename: &'static str,
+    title: &'static str,
+    color: u32,
+    bytes: &'static [u8],
+}
+static CLAUDE_LOGO: Logo =
+    Logo { filename: "claude.png", title: "Claude", color: 0xD97757, bytes: include_bytes!("assets/claude.png") };
+static CODEX_LOGO: Logo = Logo {
+    filename: "codex.png",
+    title: "ChatGPT / Codex",
+    color: 0x10A37F,
+    bytes: include_bytes!("assets/codex.png"),
+};
+fn logos(d: &Destination, e: &Event, presentation: &Presentation) -> Vec<&'static Logo> {
+    if d.format != Format::Discord || !presentation.provider_logos {
+        return Vec::new();
+    }
+    if e.event == "notification.test" {
+        return vec![&CLAUDE_LOGO, &CODEX_LOGO];
+    }
+    if !matches!(e.event.as_str(), "quota.exhausted" | "quota.window_recovered" | "quota.available") {
+        return Vec::new();
+    }
+    match e.provider.as_str() {
+        "claude" => vec![&CLAUDE_LOGO],
+        "codex" => vec![&CODEX_LOGO],
+        _ => Vec::new(),
+    }
+}
+fn multipart_body(payload: &Value, logos: &[&Logo]) -> (String, Vec<u8>) {
+    let json = payload.to_string();
+    // Everything outside JSON is fixed metadata. Random boundaries are also checked
+    // against every part to prevent a payload from ever splitting the framing.
+    let boundary = loop {
+        let boundary = format!("cliproxy-{}", uuid::Uuid::new_v4().simple());
+        if !json.contains(&boundary)
+            && logos.iter().all(|logo| !logo.bytes.windows(boundary.len()).any(|part| part == boundary.as_bytes()))
+        {
+            break boundary;
+        }
+    };
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\nContent-Type: application/json\r\n\r\n{json}\r\n").as_bytes());
+    for (id, logo) in logos.iter().enumerate() {
+        body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"files[{id}]\"; filename=\"{}\"\r\nContent-Type: image/png\r\n\r\n",logo.filename).as_bytes());
+        body.extend_from_slice(logo.bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={boundary}"), body)
 }
 pub fn cidr_contains(cidr: &str, ip: IpAddr) -> bool {
     let Some((network, bits)) = cidr.split_once('/') else {
@@ -362,7 +427,15 @@ async fn dispatch(
     if d.format == Format::Discord {
         secret.url.query_pairs_mut().append_pair("wait", "true");
     }
-    let mut request = client.post(secret.url).json(&payload(d, e, presentation));
+    let payload = payload(d, e, presentation);
+    let logos = logos(d, e, presentation);
+    let mut request = client.post(secret.url);
+    if logos.is_empty() {
+        request = request.json(&payload);
+    } else {
+        let (content_type, body) = multipart_body(&payload, &logos);
+        request = request.header(CONTENT_TYPE, content_type).body(body);
+    }
     if let Some(bearer) = secret.bearer {
         request = request.header(AUTHORIZATION, bearer);
     }
@@ -420,6 +493,9 @@ impl DateTimeParser {
             .map(|at| (at.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds())
     }
 }
+#[cfg(test)]
+#[path = "logo_tests.rs"]
+mod logo_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
