@@ -1,6 +1,6 @@
 # Provider logo assets
 
-`claude.png` and `codex.png` are the 128×128 Discord thumbnail attachments used by quota notifications. Their standalone SVG sources reuse the `logo-claude` and `logo-codex` symbols from [`ui/logos.svg`](../../../ui/logos.svg), with a 32×32 canvas, four-unit padding, and light rounded-square backgrounds. Claude uses a `#FAF9F5` tile with its `#D97757` mark; Codex uses a white tile with a dark mark and a `#10A37F` Discord embed accent.
+`claude.png` and `codex.png` are the 128×128 Discord thumbnail attachments used by quota notifications. Their standalone SVG sources reuse the `logo-claude` and `logo-codex` symbols from [`ui/logos.svg`](../../../ui/logos.svg), with a transparent 32×32 canvas and four-unit padding. Claude uses its `#D97757` orange mark; Codex uses `#10A37F` green. Colored marks remain visible on light and dark Discord themes without a background tile. The Discord embed accents use matching colors.
 
 The dashboard's `ui/logos.svg` is the canonical artwork. Regenerate both standalone SVGs and PNGs from it with Python's standard library and [librsvg's `rsvg-convert`](https://gitlab.gnome.org/GNOME/librsvg):
 

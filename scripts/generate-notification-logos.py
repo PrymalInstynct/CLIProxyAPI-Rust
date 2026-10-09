@@ -18,20 +18,17 @@ def main():
     ET.register_namespace("", namespace)
     symbols = ET.fromstring(source)
     assets.mkdir(parents=True, exist_ok=True)
-    for provider, title, background in [
-        ("claude", "Claude", "#FAF9F5"),
-        ("codex", "ChatGPT / Codex", "#FFFFFF"),
+    for provider, title, color in [
+        ("claude", "Claude", "#D97757"),
+        ("codex", "ChatGPT / Codex", "#10A37F"),
     ]:
         symbol = next(x for x in symbols.iter() if x.attrib.get("id") == "logo-" + provider)
         svg = ET.Element("{" + namespace + "}svg", {
             "viewBox": "0 0 32 32", "width": "128", "height": "128",
             "role": "img", "aria-label": title,
         })
-        ET.SubElement(svg, "{" + namespace + "}rect", {
-            "width": "32", "height": "32", "rx": "7", "fill": background,
-        })
         group = ET.SubElement(svg, "{" + namespace + "}g", {
-            "transform": "translate(4 4)", "color": "#111111",
+            "transform": "translate(4 4)", "color": color,
         })
         for child in symbol:
             group.append(copy.deepcopy(child))
