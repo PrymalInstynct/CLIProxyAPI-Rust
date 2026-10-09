@@ -699,14 +699,20 @@ pub async fn worker(app: Arc<App>) {
                     })
                 })
             };
-            let complete =
-                {
-                    let inner = app.notifications.inner.lock();
-                    inner.store.as_ref().and_then(|store| store.journal.subscriptions.get(&id)).is_some_and(
-                        |subscription| fresh.get(&id).is_some_and(|evidence| evidence.complete(subscription)),
-                    )
-                };
-            if !complete || st.notification_evidence.overflow || confirmation_needed {
+            let awaiting_confirmation = {
+                let inner = app.notifications.inner.lock();
+                inner.store.as_ref().is_some_and(|store| {
+                    let recovery_pending = store.journal.pending.iter().any(|pending| {
+                        pending.event.subscription == id
+                            && matches!(pending.event.event.as_str(), "quota.available" | "quota.window_recovered")
+                    });
+                    store.journal.subscriptions.get(&id).is_some_and(|subscription| {
+                        (recovery_pending || subscription.windows.values().any(|window| window.exhausted))
+                            && !fresh.get(&id).is_some_and(|evidence| evidence.complete(subscription))
+                    })
+                })
+            };
+            if awaiting_confirmation || st.notification_evidence.overflow || confirmation_needed {
                 st.quota.refreshed_at = None;
             }
             snapshots.push((
@@ -1215,6 +1221,79 @@ mod tests {
         let status = app.notifications.status(app);
         assert_eq!(status["pending"], 1);
         assert!(status["logs"].as_array().unwrap().is_empty());
+    }
+    #[tokio::test]
+    /// Verify missing learned windows do not force extra polling for healthy subscriptions, including after restart.
+    async fn healthy_subscription_with_omitted_model_window_keeps_normal_poll_schedule() {
+        for restart in [false, true] {
+            let (temp, app, acct) = fixture(true);
+            app.notifications.open().unwrap();
+            {
+                let mut inner = app.notifications.inner.lock();
+                let store = inner.store.as_mut().unwrap();
+                let id = identity(&acct, &store.journal.installation);
+                let mut subscription = Subscription { provider: "claude".into(), ..Default::default() };
+                assert!(
+                    subscription
+                        .apply(
+                            &id,
+                            &state::Observation {
+                                sequence: 1,
+                                at: Utc::now() - chrono::Duration::minutes(5),
+                                windows: vec![
+                                    sample("5h", 10.0),
+                                    sample("week", 20.0),
+                                    crate::quota::Window { model: Some("opus".into()), ..sample("week opus", 30.0) }
+                                ],
+                                authoritative: true,
+                                unknown: None,
+                            },
+                        )
+                        .is_empty()
+                );
+                store.journal.subscriptions.insert(id, subscription);
+                store.save().unwrap();
+            }
+            let app = if restart {
+                let cfg = (*app.cfg()).clone();
+                drop(acct);
+                drop(app);
+                App::new(cfg, temp.0.join("config.yaml"))
+            } else {
+                app
+            };
+            let acct = app.pool.all()[0].clone();
+            crate::quota::authoritative(&mut acct.state.lock(), vec![sample("5h", 10.0), sample("week", 20.0)], None);
+            let refreshed = acct.state.lock().quota.refreshed_at;
+            assert!(refreshed.is_some());
+            let task = tokio::spawn(worker(app.clone()));
+            consumed(&app, &acct).await;
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            assert_eq!(acct.state.lock().quota.refreshed_at, refreshed);
+            assert_eq!(app.notifications.status(&app)["pending"], 0);
+            assert!(app.notifications.status(&app)["logs"].as_array().unwrap().is_empty());
+            task.abort();
+            let _ = task.await;
+        }
+    }
+    #[tokio::test]
+    /// Verify exhausted windows and pending recovery still request authoritative confirmation of missing windows.
+    async fn incomplete_confirmation_keeps_refreshing_exhausted_or_pending_recovery() {
+        for kind in ["quota.exhausted", "quota.available"] {
+            let (_temp, app, acct) = fixture(true);
+            seed_pending(&app, &acct, kind);
+            let task = tokio::spawn(worker(app.clone()));
+            let used = if kind == "quota.exhausted" { 100.0 } else { 20.0 };
+            crate::quota::authoritative(&mut acct.state.lock(), vec![sample("week", used)], None);
+            consumed(&app, &acct).await;
+            assert_waiting(&app);
+            acct.state.lock().quota.refreshed_at = Some(Utc::now());
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            assert!(acct.state.lock().quota.refreshed_at.is_none());
+            assert_waiting(&app);
+            task.abort();
+            let _ = task.await;
+        }
     }
     #[tokio::test]
     /// Verify that persisted available after restart waits for all fresh authoritative windows.

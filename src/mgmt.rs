@@ -440,6 +440,7 @@ struct ToggleBody {
     disabled: bool,
 }
 
+/// Persist account activation and invalidate quota responses and notification evidence captured before a toggle.
 async fn toggle_account(State(app): State<Arc<App>>, Path(id): Path<String>, Json(b): Json<ToggleBody>) -> Response {
     let Some(acct) = app.pool.get(&id) else { return err(StatusCode::NOT_FOUND, "unknown account") };
     if let Some(path) = &acct.path
@@ -447,7 +448,15 @@ async fn toggle_account(State(app): State<Arc<App>>, Path(id): Path<String>, Jso
     {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
-    acct.state.lock().disabled = b.disabled;
+    {
+        let mut st = acct.state.lock();
+        if st.disabled != b.disabled {
+            st.quota_epoch += 1;
+            st.notifications_changed_at = Some(chrono::Utc::now());
+            st.notification_evidence = Default::default();
+        }
+        st.disabled = b.disabled;
+    }
     app.broadcast("accounts", Value::Null);
     ok()
 }

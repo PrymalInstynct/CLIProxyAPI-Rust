@@ -74,6 +74,56 @@ async fn serve(app: Arc<crate::state::App>) -> (String, TestServer) {
 }
 
 #[tokio::test]
+/// Verify dashboard toggles invalidate in-flight quota responses and pre-pause notification evidence.
+async fn dashboard_account_toggle_discards_stale_quota_and_notification_evidence() {
+    let temp = Temp::new();
+    let app = app(&temp, true, None);
+    private_file(
+        &app.cfg().auth_dir().join("account.json"),
+        &json!({"type":"claude","account_id":"toggle-test-account","access_token":"toggle-test-token","expired":"2099-01-01T00:00:00Z"}).to_string(),
+    );
+    app.reload_accounts();
+    let account = app.pool.all()[0].clone();
+    let epoch = account.quota_epoch();
+    let (origin, _server) = serve(app.clone()).await;
+    let client = reqwest::Client::new();
+    let route = format!("{origin}/accounts/{}/toggle", account.id);
+    let window = crate::quota::Window { name: "5h".into(), used: 10.0, resets_at: None, model: None };
+
+    for disabled in [true, false] {
+        account.state.lock().notification_evidence.observe(std::slice::from_ref(&window), true);
+        let before = account.quota_epoch();
+        let response = client
+            .post(&route)
+            .bearer_auth("notification-test-management-key")
+            .json(&json!({"disabled":disabled}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        {
+            let state = account.state.lock();
+            assert_eq!(state.disabled, disabled);
+            assert_eq!(state.quota_epoch, before + 1);
+            assert!(state.notifications_changed_at.is_some());
+            assert!(state.notification_evidence.observations.is_empty());
+        }
+        // The later file-watcher reload must preserve the invalidation already performed by the route.
+        app.reload_accounts();
+        assert_eq!(app.pool.all()[0].quota_epoch(), before + 1);
+    }
+    account.cool_quota("claude-sonnet-5-5", chrono::Utc::now() + chrono::Duration::hours(1), "quota", epoch);
+    let headers = reqwest::header::HeaderMap::from_iter([(
+        "anthropic-ratelimit-unified-5h-status".parse().unwrap(),
+        "rejected".parse().unwrap(),
+    )]);
+    crate::quota::observe(&account, &headers, epoch);
+    let state = account.state.lock();
+    assert!(state.quota_cooldowns.is_empty());
+    assert!(state.notification_evidence.observations.is_empty());
+}
+
+#[tokio::test]
 /// Verify that notification test blocks loopback and persists only sanitized details.
 async fn notification_test_blocks_loopback_and_persists_only_sanitized_details() {
     let temp = Temp::new();
