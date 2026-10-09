@@ -49,7 +49,7 @@ The dashboard labels credentials **Configured**, **Externally managed**, or **No
 
 Notification messages use the current sanitized account display name shown in Accounts. Depending on the credential, that name may be an email address, provider username, or credential filename fallback. Treat it as identifying information sent to each destination. The generic webhook payload adds `subscription_display_name`; its existing `subscription` field remains the installation-local opaque ID. The current name is resolved when sending and in the live status response when the account is available, and is never written to the durable outbox or journal. Test notifications are marked `notification.test` and contain no fabricated account identity or provider.
 
-Choose an IANA time zone under **Config → Notifications → Notification time zone**, or select **Use browser time zone**. The default is `UTC`. The setting takes effect on save without a restart, and daylight-saving changes follow the selected zone automatically. Chat messages include local timestamps with their time-zone abbreviation and numeric UTC offset. Generic webhook JSON retains the UTC `observed_at` and `resets_at` fields and adds `time_zone`, `observed_at_local`, and `resets_at_local`; local RFC3339 values include the numeric offset, while `time_zone` carries the IANA name. Timestamp values in the journal remain UTC.
+Choose an IANA time zone under **Config → Notifications → Notification time zone**, or select **Use browser time zone**. The default is `UTC`. The setting takes effect on save without a restart, and daylight-saving changes follow the selected zone automatically. Chat messages use the selected local time with daylight-saving adjustments, without time-zone names, abbreviations or offsets in the visible text. Generic webhook JSON retains the UTC `observed_at` and `resets_at` fields and adds `time_zone`, `observed_at_local`, and `resets_at_local`; local RFC3339 values include the numeric offset, while `time_zone` carries the IANA name. Timestamp values in the journal remain UTC.
 
 The management API exposes the same status and test action. `GET /api/notifications` returns sanitized notification status, including `credential_ui_enabled`, `credential_ui_ready`, a safe `credential_ui_reason`, and normalized `credential_public_url`. `POST /api/notifications/{id}/test` makes one delivery attempt and returns its result. Both routes use the normal dashboard management authentication.
 
@@ -63,6 +63,25 @@ curl -X POST http://127.0.0.1:8317/api/notifications/ops-discord/test \
 ```
 
 If the dashboard is localhost-only and no management key is configured, omit the Authorization header.
+
+## Message format
+
+Chat notifications use a readable limit title and the current provider/account display name. Exhaustion includes when it was detected and the provider's estimated reset, or `not provided` when the provider has no reset time. Reset estimates do not trigger recovery by themselves; availability is confirmed by fresh usage data.
+
+```text
+5-hour limit exhausted
+Claude · Work account
+Detected: 2026-10-09 10:24:15
+Estimated reset: 2026-10-09 13:14:58
+```
+
+```text
+Subscription quota available again
+Claude · Work account
+Confirmed available: 2026-10-09 13:15:02
+```
+
+When only one window recovers, the title identifies that window (for example, `5-hour limit available again`) and `Other limits still exhausted: Weekly limit` appears only if another limit remains blocked. Exhaustion messages omit the redundant blocker list. Recovery messages do not display a future reset estimate for the new window. Generic webhook event names and machine timestamps remain unchanged.
 
 ## Credential storage and access
 

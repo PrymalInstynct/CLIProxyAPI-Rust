@@ -313,6 +313,8 @@ pub struct AccountState {
     pub quota: crate::quota::Quota,
     pub notification_evidence: crate::notifications::state::Evidence,
     pub notifications_enabled: bool,
+    /// In-memory cutoff also records pauses shorter than a notification worker tick.
+    pub notifications_changed_at: Option<DateTime<Utc>>,
 }
 
 /// Counts an actual request attempt, including streaming, until completion or cancellation.
@@ -953,6 +955,10 @@ impl Pool {
                     };
                     *prev.cred.write() = s.cred;
                     let mut st = prev.state.lock();
+                    if st.disabled != s.disabled || st.notifications_enabled != cfg.notifications.enabled {
+                        st.notifications_changed_at = Some(Utc::now());
+                        st.notification_evidence = Default::default();
+                    }
                     if st.disabled != s.disabled {
                         st.quota_epoch += 1;
                     }
@@ -999,7 +1005,20 @@ impl Pool {
                         counters: st.counters.clone(),
                         quota: st.quota.clone(),
                         quota_epoch: st.quota_epoch + u64::from(st.disabled != s.disabled),
-                        notification_evidence: st.notification_evidence.clone(),
+                        notification_evidence: if st.disabled != s.disabled
+                            || st.notifications_enabled != cfg.notifications.enabled
+                        {
+                            Default::default()
+                        } else {
+                            st.notification_evidence.clone()
+                        },
+                        notifications_changed_at: if st.disabled != s.disabled
+                            || st.notifications_enabled != cfg.notifications.enabled
+                        {
+                            Some(Utc::now())
+                        } else {
+                            st.notifications_changed_at
+                        },
                         ..Default::default()
                     }
                 })

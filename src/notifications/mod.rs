@@ -616,6 +616,25 @@ pub async fn worker(app: Arc<App>) {
             present.insert(id.clone());
             let key = format!("{}:{}", acct.id, id);
             let mut st = acct.state.lock();
+            if let Some(changed_at) = st.notifications_changed_at
+                && fresh_after.get(&id).is_none_or(|previous| *previous < changed_at)
+            {
+                fresh.remove(&id);
+                seen.remove(&key);
+                fresh_after.insert(id.clone(), changed_at);
+                let inner = app.notifications.inner.lock();
+                resumed.extend(
+                    inner
+                        .store
+                        .as_ref()
+                        .unwrap()
+                        .journal
+                        .pending
+                        .iter()
+                        .filter(|pending| pending.event.subscription == id)
+                        .map(|pending| pending.event.id.clone()),
+                );
+            }
             if st.disabled {
                 fresh.remove(&id);
                 let inner = app.notifications.inner.lock();
@@ -1210,6 +1229,50 @@ mod tests {
         assert_eq!(app.notifications.status(&app)["logs"][0]["event"], "quota.available");
         task.abort();
         let _ = task.await;
+    }
+    #[tokio::test]
+    async fn brief_account_or_global_pause_requires_new_confirmation_even_between_worker_ticks() {
+        for account_pause in [false, true] {
+            let (_temp, app, acct) = fixture(true);
+            seed_pending(&app, &acct, "quota.available");
+            {
+                let mut inner = app.notifications.inner.lock();
+                let store = inner.store.as_mut().unwrap();
+                store.journal.pending[0].next = Utc::now() + chrono::Duration::hours(1);
+                store.save().unwrap();
+            }
+            let task = tokio::spawn(worker(app.clone()));
+            crate::quota::authoritative(&mut acct.state.lock(), vec![sample("5h", 10.0), sample("week", 20.0)], None);
+            consumed(&app, &acct).await;
+            // Both changes happen synchronously, before the worker can see a disabled tick.
+            if account_pause {
+                crate::accounts::set_file_disabled(acct.path.as_deref().unwrap(), true).unwrap();
+                app.reload_accounts();
+                crate::accounts::set_file_disabled(acct.path.as_deref().unwrap(), false).unwrap();
+                app.reload_accounts();
+            } else {
+                let mut cfg = (*app.cfg()).clone();
+                cfg.notifications.enabled = false;
+                app.set_config(cfg.clone());
+                cfg.notifications.enabled = true;
+                app.set_config(cfg);
+            }
+            let acct = app.pool.all()[0].clone();
+            crate::quota::authoritative(&mut acct.state.lock(), vec![sample("week", 20.0)], None);
+            {
+                let mut inner = app.notifications.inner.lock();
+                let store = inner.store.as_mut().unwrap();
+                store.journal.pending[0].next = Utc::now();
+                store.save().unwrap();
+            }
+            consumed(&app, &acct).await;
+            assert_waiting(&app);
+            crate::quota::authoritative(&mut acct.state.lock(), vec![sample("5h", 10.0)], None);
+            until_logs(&app, 1).await;
+            assert_eq!(app.notifications.status(&app)["logs"][0]["event"], "quota.available");
+            task.abort();
+            let _ = task.await;
+        }
     }
     #[tokio::test]
     async fn persisted_partial_recovery_waits_but_current_partial_recovery_dispatches() {

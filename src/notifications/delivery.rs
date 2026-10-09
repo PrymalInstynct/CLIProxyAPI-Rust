@@ -141,7 +141,7 @@ impl Presentation {
         self
     }
     fn local(&self, at: chrono::DateTime<chrono::Utc>) -> String {
-        at.with_timezone(&self.time_zone).format("%Y-%m-%d %H:%M:%S %Z (%:z)").to_string()
+        at.with_timezone(&self.time_zone).format("%Y-%m-%d %H:%M:%S").to_string()
     }
 }
 pub fn safe_name(name: &str) -> String {
@@ -176,34 +176,45 @@ fn chat_name(name: &str, format: Format) -> String {
     }
     escaped
 }
+fn limit_label(window: &str, model: Option<&str>) -> &'static str {
+    match (window, model) {
+        ("5h", _) => "5-hour limit",
+        ("week opus", _) | ("week", Some("opus")) => "Weekly Opus limit",
+        ("week sonnet", _) | ("week", Some("sonnet")) => "Weekly Sonnet limit",
+        ("week overage", _) => "Weekly overage limit",
+        ("week", _) => "Weekly limit",
+        ("day", _) => "Daily limit",
+        ("unknown opus", _) | ("unknown", Some("opus")) => "Opus quota",
+        ("unknown sonnet", _) | ("unknown", Some("sonnet")) => "Sonnet quota",
+        _ => "Subscription quota",
+    }
+}
 fn text(e: &Event, presentation: &Presentation, format: Format) -> String {
     if e.event == "notification.test" {
-        return format!(
-            "Notification delivery test — sent {} [{}].",
-            presentation.local(e.observed_at),
-            presentation.time_zone.name()
-        );
+        return format!("Notification delivery test\nSent: {}", presentation.local(e.observed_at));
     }
     let name = chat_name(presentation.display_name.as_deref().unwrap_or("Subscription"), format);
-    let mut text = format!(
-        "{}: {} subscription {} — {}{} (observed {} [{}]).",
-        e.event,
-        e.provider,
-        name,
-        e.window,
-        e.model.as_ref().map(|s| format!(" ({s})")).unwrap_or_default(),
-        presentation.local(e.observed_at),
-        presentation.time_zone.name()
-    );
-    if let Some(reset) = e.resets_at {
-        text.push_str(&format!(
-            " Estimated reset {} [{}]; confirmation required.",
-            presentation.local(reset),
-            presentation.time_zone.name()
-        ));
+    let provider = match e.provider.as_str() {
+        "claude" => "Claude",
+        "codex" => "ChatGPT / Codex",
+        _ => "AI provider",
+    };
+    let limit = limit_label(&e.window, e.model.as_deref());
+    let title = match e.event.as_str() {
+        "quota.exhausted" => format!("{limit} exhausted"),
+        "quota.window_recovered" => format!("{limit} available again"),
+        "quota.available" => "Subscription quota available again".into(),
+        _ => "Subscription quota update".into(),
+    };
+    let timestamp_label = if e.event == "quota.exhausted" { "Detected" } else { "Confirmed available" };
+    let mut text = format!("{title}\n{provider} · {name}\n{timestamp_label}: {}", presentation.local(e.observed_at));
+    if e.event == "quota.exhausted" {
+        let reset = e.resets_at.map(|reset| presentation.local(reset)).unwrap_or_else(|| "not provided".into());
+        text.push_str(&format!("\nEstimated reset: {reset}"));
     }
-    if !e.remaining_blockers.is_empty() {
-        text.push_str(&format!(" Still exhausted: {}.", e.remaining_blockers.join(", ")));
+    if e.event == "quota.window_recovered" && !e.remaining_blockers.is_empty() {
+        let blockers: Vec<_> = e.remaining_blockers.iter().map(|window| limit_label(window, None)).collect();
+        text.push_str(&format!("\nOther limits still exhausted: {}", blockers.join(", ")));
     }
     text
 }
@@ -563,8 +574,10 @@ mod tests {
         let human = text(&event, &presentation, Format::Telegram);
         assert!(human.contains("My subscription"));
         assert!(!human.contains(&event.subscription));
-        assert!(human.contains("2026-01-01 05:00:00 MST (-07:00) [America/Denver]"));
-        assert!(human.contains("2026-07-01 06:00:00 MDT (-06:00) [America/Denver]"));
+        assert!(human.contains("Detected: 2026-01-01 05:00:00"));
+        assert!(human.contains("Estimated reset: 2026-07-01 06:00:00"));
+        assert!(!human.contains("MST") && !human.contains("MDT") && !human.contains("America/Denver"));
+        assert!(!human.contains("-07:00") && !human.contains("-06:00"));
         let generic = payload(&destination(Format::Generic), &event, &presentation);
         assert_eq!(generic["subscription"], event.subscription);
         assert_eq!(generic["subscription_display_name"], "My subscription");
@@ -573,6 +586,84 @@ mod tests {
         assert_eq!(generic["resets_at_local"], "2026-07-01T06:00:00-06:00");
         assert_eq!(generic["observed_at"], json!(event.observed_at));
         assert_eq!(generic["resets_at"], json!(event.resets_at));
+    }
+    #[test]
+    fn chat_messages_distinguish_exhaustion_partial_recovery_and_full_availability() {
+        let mut event = event();
+        event.provider = "codex".into();
+        let presentation = Presentation::new(Some("Work account"), chrono_tz::UTC);
+        for (window, title) in [
+            ("5h", "5-hour limit"),
+            ("week", "Weekly limit"),
+            ("week opus", "Weekly Opus limit"),
+            ("week sonnet", "Weekly Sonnet limit"),
+            ("day", "Daily limit"),
+            ("unknown", "Subscription quota"),
+        ] {
+            event.window = window.into();
+            let message = text(&event, &presentation, Format::Discord);
+            assert!(message.starts_with(&format!("{title} exhausted\nChatGPT / Codex · Work account\n")));
+            assert!(message.contains("Detected: 2026-01-01 12:00:00"));
+            assert!(message.contains("Estimated reset: 2026-07-01 12:00:00"));
+            assert!(!message.contains("quota.exhausted") && !message.contains("still exhausted"));
+            assert!(!message.contains("confirmation required") && !message.contains("UTC"));
+        }
+        event.window = "5h".into();
+        event.event = "quota.window_recovered".into();
+        event.remaining_blockers = vec!["week".into(), "week opus".into()];
+        let message = text(&event, &presentation, Format::Discord);
+        assert!(message.starts_with("5-hour limit available again\nChatGPT / Codex · Work account\n"));
+        assert!(message.contains("Confirmed available: 2026-01-01 12:00:00"));
+        assert!(message.contains("Other limits still exhausted: Weekly limit, Weekly Opus limit"));
+        assert!(!message.contains("Estimated reset"));
+        event.event = "quota.available".into();
+        event.window = "all".into();
+        event.remaining_blockers.clear();
+        let message = text(&event, &presentation, Format::Discord);
+        assert!(message.starts_with("Subscription quota available again\n"));
+        assert!(!message.contains("exhausted") && !message.contains("reset"));
+        event.event = "quota.exhausted".into();
+        event.window = "unknown".into();
+        event.resets_at = None;
+        assert!(text(&event, &presentation, Format::Discord).ends_with("Estimated reset: not provided"));
+    }
+    #[test]
+    fn chat_platforms_preserve_readable_messages_and_safe_payload_contracts() {
+        let event = event();
+        let presentation = Presentation::new(Some("Work account"), chrono_tz::UTC);
+        for format in [Format::Discord, Format::Slack, Format::Mattermost, Format::Teams, Format::Telegram] {
+            let value = payload(&destination(format), &event, &presentation);
+            let message = match format {
+                Format::Discord => {
+                    assert_eq!(value["allowed_mentions"]["parse"], json!([]));
+                    value["content"].as_str().unwrap()
+                }
+                Format::Teams => {
+                    assert_eq!(value["type"], "message");
+                    let attachment = &value["attachments"][0];
+                    assert_eq!(attachment["contentType"], "application/vnd.microsoft.card.adaptive");
+                    assert_eq!(attachment["content"]["type"], "AdaptiveCard");
+                    assert_eq!(attachment["content"]["body"][0]["type"], "TextBlock");
+                    assert_eq!(attachment["content"]["body"][0]["wrap"], true);
+                    attachment["content"]["body"][0]["text"].as_str().unwrap()
+                }
+                Format::Slack => {
+                    assert_eq!(value["mrkdwn"], false);
+                    assert_eq!(value["link_names"], false);
+                    assert_eq!(value["unfurl_links"], false);
+                    value["text"].as_str().unwrap()
+                }
+                Format::Telegram => {
+                    assert_eq!(value["chat_id"], "1234");
+                    assert_eq!(value["disable_web_page_preview"], true);
+                    assert!(value.get("parse_mode").is_none());
+                    value["text"].as_str().unwrap()
+                }
+                _ => value["text"].as_str().unwrap(),
+            };
+            assert!(message.starts_with("5-hour limit exhausted\nClaude · Work account\nDetected: "));
+            assert!(message.contains("\nEstimated reset: "));
+        }
     }
     #[test]
     fn display_names_are_bounded_single_line_and_cannot_add_mentions_links_or_markdown() {
