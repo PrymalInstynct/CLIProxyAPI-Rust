@@ -263,7 +263,8 @@ notifications:
   enabled: false            # configure destinations under Config → Notifications
   time-zone: UTC            # IANA time zone for message timestamps; e.g. America/Denver
   provider-logos: true      # bundled logo thumbnails for Discord alerts
-  destinations: []          # webhook credentials come from private files or designated environment variables
+  credential-proxy-cidrs: [] # exact trusted HTTPS proxy addresses; startup-only, never trust all clients
+  destinations: []          # add credentials in the dashboard; private files/environment also supported
 debug: false
 
 # API keys (optional). Accounts (Claude, Codex, Antigravity, Kimi, xAI, Meta, Devin, Vertex)

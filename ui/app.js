@@ -26,7 +26,7 @@ const S = {
   confirm: null,
   resets: {}, // account-specific confirmations and errors
   resetModal: null,
-  notifications: { status: null, loading: false, error: null, busy: null, testMsg: null, filter: '' },
+  notifications: { status: null, loading: false, error: null, busy: null, testMsg: null, filter: '', credentialEditor: null, credentialRemove: null, credentialMsg: null },
   config: { values: null, saved: null, defaults: {}, revision: '', path: '', ignored: [], restart_fields: [],
     msg: null, busy: false, loading: false, section: 'server', provider: 'claude', oauthProvider: 'claude',
     errors: {}, opens: {}, secrets: {}, reloadConfirm: false, reveal: false, raw: { text: null, saved: null, loading: false } },

@@ -6,7 +6,7 @@ The monitor observes the same quota data used by routing and periodically refres
 
 ## Configure a destination
 
-Set up a webhook in the destination service, then add a destination under **Config → Notifications**. YAML stores destination settings and safe credential references; the full webhook URL and bearer token are secrets and belong in the environment or secret directory described below.
+Set up a webhook in the destination service, then add and save a destination under **Config → Notifications**. Choose **Add credentials** and enter its URL in the write-only **Webhook URL** field; add a token in **Bearer token (optional)** if needed. Credentials are saved separately from YAML.
 
 The corresponding configuration is:
 
@@ -35,7 +35,9 @@ notifications:
 
 Destination IDs are unique lowercase names of up to 32 characters using `a-z`, `0-9` and hyphens; do not start or end an ID with a hyphen. You can configure at most eight destinations. Supported formats are `generic`, `discord`, `slack`, `mattermost`, `teams` and `telegram`. Telegram requires a `chat-id`. Keep the ID stable when rotating credentials so queued retries remain associated with the destination.
 
-The dashboard lets you enable or disable notifications and individual destinations, edit destination IDs and formats, set Telegram chat IDs, toggle Discord **Provider logos**, and inspect a safe delivery log. **Send test** makes one delivery attempt and reports its result; it may take up to 20 seconds and is limited to one attempt per destination every 30 seconds. The test previews both bundled provider logos. Status shows safe categories and HTTP status codes. It does not expose webhook URLs, tokens, remote response bodies, or raw network errors. Activity refreshes every five seconds while the section is open and can be filtered by destination.
+The dashboard lets you enable or disable notifications and individual destinations, edit destination IDs and formats, set Telegram chat IDs, toggle Discord **Provider logos**, and inspect a safe delivery log. First save the destination, then choose **Add credentials** (or **Replace credentials**) and use **Save credentials**. Saving replaces the complete bundle; an empty bearer field clears any previous token. **Remove credentials** requires inline confirmation (**Remove** or **Keep credentials**). The password fields clear after every attempt. Values are never returned to the browser, kept in browser storage, written to YAML, or logged. **Send test** makes one delivery attempt and reports its result; it may take up to 20 seconds and is limited to one attempt per destination every 30 seconds. The test previews both bundled provider logos. Status shows safe categories and HTTP status codes. It does not expose webhook URLs, tokens, remote response bodies, or raw network errors. Activity refreshes every five seconds while the section is open and can be filtered by destination.
+
+The dashboard labels credentials **Configured**, **Externally managed**, or **Not configured**. The status API uses `credential_source` (`managed`, `external`, or `none`) and the booleans `credential_configured`, `credential_ready`, and `credential_editable`. The dashboard can write only `managed` credentials. Environment variables and manually provisioned secret files remain supported as `external` credentials and are read-only in the UI. An external source is authoritative: if it is malformed or unavailable, the proxy reports it as not ready and does not silently fall back to a managed copy.
 
 ## Names and time zones
 
@@ -56,13 +58,39 @@ curl -X POST http://127.0.0.1:8317/api/notifications/ops-discord/test \
 
 If the dashboard is localhost-only and no management key is configured, omit the Authorization header.
 
-## Supply credentials
+## Credential storage and access
 
-Choose either environment variables or secret files. The webhook URL itself is sensitive: many services embed a credential in its path or query string. Do not put URLs or tokens in YAML, dashboard fields, command-line arguments, or logs.
+Managed credential bundles are stored as plaintext JSON at `auth-dir/.notification-credentials/<id>.json`, separately from `config.yaml`, in a private `0700` directory with `0600` files. Writes use a temporary file, atomic replacement, and filesystem sync. These permissions protect against other ordinary local users; they do not encrypt the credentials. The root user and anyone who can read host backups or snapshots can access them. Protect the auth directory and its backups accordingly. Many webhook URLs contain credentials in the path or query, so protect the complete URL.
 
-### Secret files (recommended for Docker)
+Managed credential writes are supported on Unix systems with these file permissions. On Windows, writes fail closed because equivalent ACL protection is not implemented; use the environment-variable or external secret-file methods below.
 
-Create one file for each destination. The filename is its destination ID followed by `.url`; an optional `.bearer` file supplies an Authorization bearer token:
+The credential API accepts only a valid saved destination ID. `PUT /api/notifications/{id}/credentials` replaces the complete URL/token bundle; `DELETE /api/notifications/{id}/credentials` removes it and takes no body. PUT accepts same-origin JSON up to 20 KiB and returns only safe status. Its JSON fields are `url` and optional `bearer_token`; an empty or omitted token clears the prior token. Use the normal management `Authorization: Bearer` header when a management key is configured; query-string keys are not accepted. For example, use placeholders and a protected input method rather than putting real credentials in shell history:
+
+```json
+{"url":"https://webhook.example/REDACTED","bearer_token":"REDACTED"}
+```
+
+The browser requires JSON same-origin requests to prevent ordinary cross-origin form submissions from saving or deleting credentials.
+
+Credential writes require HTTPS for remote dashboard access. Use the proxy's startup TLS support, or configure the exact trusted reverse-proxy CIDRs with `notifications.credential-proxy-cidrs`. The reverse proxy must strip client-supplied forwarding headers and set its own `X-Forwarded-Proto: https`; if it uses `X-Forwarded-Host`, that value must match the browser-visible host. The allowlist defaults to empty and is startup-only. Trust only the reverse proxy's precise address, such as `10.1.2.3/32`; never allow all private addresses or a Docker bridge/NAT gateway. Restart after changing this list. Plain HTTP is permitted only for a direct request from a loopback peer to `localhost` or a loopback IP Host, with no forwarding headers.
+
+Example for a reverse proxy at one fixed address:
+
+```yaml
+notifications:
+  credential-proxy-cidrs:
+    - 10.1.2.3/32
+```
+
+Configure only the actual proxy peer address. The CIDR does not describe the webhook server or the clients reaching the proxy.
+
+## Advanced credential sources
+
+Use managed credentials in the dashboard for the normal setup. Environment variables or mounted files are available when deployment tooling provisions secrets outside the UI. The webhook URL remains a secret and must never be placed in YAML, command-line arguments, browser storage, or logs.
+
+### Secret files
+
+For externally managed files, create one file for each destination. The filename is its destination ID followed by `.url`; an optional `.bearer` file supplies an Authorization bearer token:
 
 ```text
 /run/notification-secrets/ops-discord.url
@@ -72,7 +100,7 @@ Create one file for each destination. The filename is its destination ID followe
 
 Files must be regular files, must not be symlinks, must be at most 8 KiB, and on Unix must be owned by the server's user or root with no group or world permissions. Do not change permissions on a read-only container secret mount; provision it with an accepted owner and mode. Changing the `secrets-dir` setting or private network permissions requires a restart.
 
-For Docker Compose, mount a host directory read-only and set `secrets-dir` to its container path. The auth directory remains the persistent writable location for accounts and notification state:
+For Docker Compose, mount the external secret directory read-only and set `secrets-dir` to its container path. The auth directory remains the persistent writable location for accounts, managed credentials, and notification state:
 
 ```yaml
 services:
@@ -83,7 +111,7 @@ services:
       - ./notification-secrets:/run/notification-secrets:ro
 ```
 
-Set the directory and secret file permissions on the host before starting the container. The notification state and durable delivery queue live under `auth-dir/.quota-notifications`, so keep the auth directory persistent and writable.
+Set the directory and secret file permissions on the host before starting the container. The notification state and durable delivery queue live under `auth-dir/.quota-notifications`; managed credentials live separately under `auth-dir/.notification-credentials`. Keep the auth directory persistent and writable.
 
 ### Environment variables
 

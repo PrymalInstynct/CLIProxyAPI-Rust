@@ -239,7 +239,7 @@ Choose **Used** or **Remaining** beside the quota meters on Overview or Accounts
 
 **Banked resets** (off by default). Claude and ChatGPT sometimes give subscribers saved resets that clear a usage limit early. Turn on `banked-resets` (Config, Connections) and subscriptions that have some show a badge beside the account name; click it to see expiry dates and spend one, always with a confirmation. It relies on unofficial provider endpoints, checks every 30 minutes, and keeps a crash-safe journal so a reset is never spent twice. See [banked resets](docs/banked-resets.md).
 
-**Quota notifications** (off by default). Send confirmed Claude and Codex subscription quota exhaustion and recovery events to generic webhooks, Discord, Slack, Mattermost, Teams Workflows or Telegram. Messages use the account's current dashboard display name and local timestamps; Discord provider-logo thumbnails are bundled and on by default, with a dashboard toggle. Configure the IANA time zone and destinations in the dashboard; keep webhook URLs and tokens in environment variables or private secret files. See [notification setup and troubleshooting](docs/notifications.md).
+**Quota notifications** (off by default). Send confirmed Claude and Codex subscription quota exhaustion and recovery events to generic webhooks, Discord, Slack, Mattermost, Teams Workflows or Telegram. Messages use the account's current dashboard display name and local timestamps; Discord provider-logo thumbnails are bundled and on by default, with a dashboard toggle. Configure destinations and time zone in the dashboard, then save webhook URLs and optional tokens through its write-only credential form. Environment variables and mounted secret files remain available for externally managed deployments. See [notification setup and troubleshooting](docs/notifications.md).
 
 <sub>Screenshots use sample data.</sub>
 
@@ -266,6 +266,7 @@ banked-resets: false          # show and spend banked Claude/ChatGPT limit reset
 notifications:
   enabled: false              # confirmed Claude/Codex subscription quota events; see docs/notifications.md
   time-zone: UTC              # notification timestamp display; select in Config → Notifications
+  provider-logos: true        # Discord thumbnails; toggle in Config → Notifications
 
 claude-api-key:
   - api-key: "sk-ant-..."

@@ -726,7 +726,10 @@ pub fn restart_fields(startup: &Config, current: &Config) -> Vec<&'static str> {
     }
     let old = serde_json::to_value(&startup.notifications).unwrap_or_default();
     let new = serde_json::to_value(&current.notifications).unwrap_or_default();
-    if ["secrets-dir", "private-endpoints", "ca-file"].iter().any(|key| old[*key] != new[*key]) {
+    if ["secrets-dir", "private-endpoints", "ca-file", "credential-proxy-cidrs"]
+        .iter()
+        .any(|key| old[*key] != new[*key])
+    {
         fields.push("notification credential and network permissions");
     }
     if startup.auth_dir != current.auth_dir {
@@ -779,6 +782,9 @@ mod tests {
         let old = Config::default();
         let mut current = old.clone();
         current.notifications.secrets_dir = Some("/run/notification-secrets".into());
+        assert!(restart_fields(&old, &current).contains(&"notification credential and network permissions"));
+        current = old.clone();
+        current.notifications.credential_proxy_cidrs = vec!["192.0.2.10/32".into()];
         assert!(restart_fields(&old, &current).contains(&"notification credential and network permissions"));
     }
 

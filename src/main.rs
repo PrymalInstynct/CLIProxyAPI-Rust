@@ -11,6 +11,8 @@ mod formats;
 mod ir;
 mod media;
 mod mgmt;
+#[cfg(all(test, unix))]
+mod notification_credential_tests;
 #[cfg(test)]
 mod notification_integration_tests;
 mod notifications;

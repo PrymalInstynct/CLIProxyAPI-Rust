@@ -31,8 +31,10 @@ pub fn credentials(dir: &Path, d: &Destination) -> Result<Credentials, &'static 
             Err(std::env::VarError::NotUnicode(_)) => Err("invalid_credential"),
             Err(std::env::VarError::NotPresent) => {
                 let path = dir.join(format!("{}.{extension}", d.id));
-                if !required && !path.try_exists().map_err(|_| "credential_unavailable")? {
-                    return Ok(None);
+                match std::fs::symlink_metadata(&path) {
+                    Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(_) => return Err("credential_unavailable"),
+                    Ok(_) => {}
                 }
                 // Reject symlinked directory components before opening the fixed filename.
                 let mut component = std::path::PathBuf::new();
@@ -55,7 +57,18 @@ pub fn credentials(dir: &Path, d: &Destination) -> Result<Credentials, &'static 
             }
         }
     };
-    let url = Url::parse(&read("URL", "url", true)?.ok_or("credential_unavailable")?).map_err(|_| "invalid_url")?;
+    let url = read("URL", "url", true)?.ok_or("credential_unavailable")?;
+    let bearer = read("BEARER_TOKEN", "bearer", false)?;
+    if bearer.as_ref().is_some_and(|value| value.is_empty()) {
+        return Err("invalid_bearer");
+    }
+    parse_credentials(&url, bearer.as_deref())
+}
+pub fn parse_credentials(url: &str, bearer: Option<&str>) -> Result<Credentials, &'static str> {
+    if url.len() > 8192 || bearer.is_some_and(|token| token.len() > 8192) {
+        return Err("credential_too_large");
+    }
+    let url = Url::parse(url.trim()).map_err(|_| "invalid_url")?;
     if url.scheme() != "https"
         || !url.username().is_empty()
         || url.password().is_some()
@@ -64,17 +77,42 @@ pub fn credentials(dir: &Path, d: &Destination) -> Result<Credentials, &'static 
     {
         return Err("unsafe_url");
     }
-    let bearer = read("BEARER_TOKEN", "bearer", false)?
-        .map(|v| {
-            if v.is_empty() {
-                return Err("invalid_bearer");
-            }
-            let mut header = HeaderValue::from_str(&format!("Bearer {v}")).map_err(|_| "invalid_bearer")?;
+    let bearer = bearer
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            let mut header =
+                HeaderValue::from_str(&format!("Bearer {}", value.trim())).map_err(|_| "invalid_bearer")?;
             header.set_sensitive(true);
-            Ok(header)
+            Ok::<HeaderValue, &'static str>(header)
         })
         .transpose()?;
     Ok(Credentials { url, bearer })
+}
+pub fn external_present(dir: &Path, d: &Destination) -> bool {
+    if !super::valid_id(&d.id) {
+        return false;
+    }
+    let prefix = format!("CLIPROXYAPI_NOTIFY_{}", d.id.to_ascii_uppercase().replace('-', "_"));
+    ["URL", "BEARER_TOKEN"].iter().any(|suffix| std::env::var_os(format!("{prefix}_{suffix}")).is_some())
+        || ["url", "bearer"].iter().any(|extension| {
+            match std::fs::symlink_metadata(dir.join(format!("{}.{extension}", d.id))) {
+                Ok(_) => true,
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            }
+        })
+}
+pub fn resolved_credentials(dir: &Path, root: &Path, d: &Destination) -> Result<Credentials, &'static str> {
+    if !super::valid_id(&d.id) {
+        return Err("invalid_destination");
+    }
+    if external_present(dir, d) {
+        return credentials(dir, d);
+    }
+    if !super::credentials::present(root, &d.id) {
+        return Err("credential_unavailable");
+    }
+    let bundle = super::credentials::read(root, &d.id)?;
+    parse_credentials(&bundle.url, bundle.bearer_token.as_deref())
 }
 pub struct Outcome {
     pub success: bool,
@@ -403,11 +441,12 @@ pub async fn send(
     dir: &Path,
     endpoints: &[PrivateEndpoint],
     ca_file: Option<&Path>,
+    root: &Path,
     d: &Destination,
     e: &Event,
     presentation: &Presentation,
 ) -> Outcome {
-    let secret = match credentials(dir, d) {
+    let secret = match resolved_credentials(dir, root, d) {
         Ok(secret) => secret,
         Err(reason) => return Outcome::error(reason, false),
     };

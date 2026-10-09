@@ -1,4 +1,5 @@
 //! Quota transitions and bounded secure notification delivery, inside the proxy process.
+mod credentials;
 mod delivery;
 pub mod state;
 mod store;
@@ -35,6 +36,7 @@ pub struct Config {
     pub enabled: bool,
     pub time_zone: String,
     pub provider_logos: bool,
+    pub credential_proxy_cidrs: Vec<String>,
     pub secrets_dir: Option<String>,
     pub ca_file: Option<String>,
     pub private_endpoints: Vec<PrivateEndpoint>,
@@ -46,6 +48,7 @@ impl Default for Config {
             enabled: false,
             time_zone: "UTC".into(),
             provider_logos: true,
+            credential_proxy_cidrs: Vec::new(),
             secrets_dir: None,
             ca_file: None,
             private_endpoints: Vec::new(),
@@ -90,6 +93,22 @@ pub fn valid_id(id: &str) -> bool {
 }
 impl Config {
     pub fn validate(&self) -> Result<(), String> {
+        if self.credential_proxy_cidrs.len() > 16 {
+            return Err("notifications: too many credential-proxy-cidrs".into());
+        }
+        for cidr in &self.credential_proxy_cidrs {
+            let valid = if let Some((ip, bits)) = cidr.split_once('/') {
+                ip.parse::<std::net::IpAddr>()
+                    .ok()
+                    .zip(bits.parse::<u32>().ok())
+                    .is_some_and(|(ip, bits)| bits > 0 && bits <= if ip.is_ipv4() { 32 } else { 128 })
+            } else {
+                cidr.parse::<std::net::IpAddr>().is_ok()
+            };
+            if cidr.len() > 80 || !valid {
+                return Err("notifications: invalid credential-proxy-cidrs".into());
+            }
+        }
         if self.time_zone.is_empty() || self.time_zone.len() > 64 || self.time_zone.parse::<chrono_tz::Tz>().is_err() {
             return Err("notifications: time-zone must be a valid IANA time zone".into());
         }
@@ -163,6 +182,8 @@ pub struct Service {
     secrets: PathBuf,
     private_endpoints: Vec<PrivateEndpoint>,
     ca_file: Option<PathBuf>,
+    credential_proxy_cidrs: Vec<String>,
+    credentials_write: Mutex<()>,
 }
 impl Service {
     pub fn new(cfg: &AppConfig) -> Self {
@@ -179,6 +200,8 @@ impl Service {
             secrets,
             private_endpoints: cfg.notifications.private_endpoints.clone(),
             ca_file: cfg.notifications.ca_file.as_ref().map(PathBuf::from),
+            credential_proxy_cidrs: cfg.notifications.credential_proxy_cidrs.clone(),
+            credentials_write: Mutex::new(()),
         }
     }
     fn open(&self) -> Result<(), &'static str> {
@@ -210,7 +233,11 @@ impl Service {
                 inner.store.as_ref().map(|store| store.journal.logs.clone()),
             )
         };
-        let destinations:Vec<_>=cfg.notifications.destinations.iter().map(|d|json!({"id":d.id,"format":d.format,"enabled":d.enabled,"credential_ready":delivery::credentials(&self.secrets,d).is_ok()})).collect();
+        let destinations:Vec<_>=cfg.notifications.destinations.iter().map(|d|{
+            let external=delivery::external_present(&self.secrets,d);
+            let managed=!external&&credentials::present(&self.root,&d.id);
+            json!({"id":d.id,"format":d.format,"enabled":d.enabled,"credential_ready":delivery::resolved_credentials(&self.secrets,&self.root,d).is_ok(),"credential_source":if external{"external"}else if managed{"managed"}else{"none"},"credential_configured":external||managed,"credential_editable":!external&&cfg!(unix)})
+        }).collect();
         let mut supported = 0;
         let mut unsupported = 0;
         let mut names = BTreeMap::new();
@@ -277,15 +304,74 @@ impl Service {
         let notification_config = app.cfg();
         let presentation = delivery::Presentation::new(None, time_zone(&notification_config.notifications))
             .with_provider_logos(notification_config.notifications.provider_logos);
-        let outcome =
-            delivery::send(&self.secrets, &self.private_endpoints, self.ca_file.as_deref(), &d, &event, &presentation)
-                .await;
+        let outcome = delivery::send(
+            &self.secrets,
+            &self.private_endpoints,
+            self.ca_file.as_deref(),
+            &self.root,
+            &d,
+            &event,
+            &presentation,
+        )
+        .await;
         let mut inner = self.inner.lock();
         if let Some(store) = inner.store.as_mut() {
             store.log(log(&d.id, &event, 1, &outcome, false));
             store.save()?;
         }
         if outcome.success { Ok(json!({"delivered":true,"http_status":outcome.status})) } else { Err(outcome.reason) }
+    }
+    pub fn trusted_credential_proxy(&self, peer: std::net::IpAddr) -> bool {
+        let peer = match peer {
+            std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(peer),
+            _ => peer,
+        };
+        self.credential_proxy_cidrs.iter().any(|cidr| {
+            cidr.parse::<std::net::IpAddr>().is_ok_and(|ip| ip == peer) || delivery::cidr_contains(cidr, peer)
+        })
+    }
+    pub fn save_credentials(
+        &self,
+        app: &App,
+        id: &str,
+        url: String,
+        bearer_token: Option<String>,
+    ) -> Result<(), &'static str> {
+        let cfg = app.cfg();
+        let destination = cfg
+            .notifications
+            .destinations
+            .iter()
+            .find(|destination| destination.id == id)
+            .ok_or("destination_unavailable")?;
+        let _guard = self.credentials_write.lock();
+        if delivery::external_present(&self.secrets, destination) {
+            return Err("credentials_externally_managed");
+        }
+        delivery::parse_credentials(&url, bearer_token.as_deref())?;
+        let bundle = credentials::Bundle {
+            url: url.trim().into(),
+            bearer_token: bearer_token.map(|token| token.trim().into()).filter(|token: &String| !token.is_empty()),
+        };
+        credentials::save(&self.root, id, &bundle)?;
+        app.broadcast("notifications", Value::Null);
+        Ok(())
+    }
+    pub fn remove_credentials(&self, app: &App, id: &str) -> Result<(), &'static str> {
+        let cfg = app.cfg();
+        let destination = cfg
+            .notifications
+            .destinations
+            .iter()
+            .find(|destination| destination.id == id)
+            .ok_or("destination_unavailable")?;
+        let _guard = self.credentials_write.lock();
+        if delivery::external_present(&self.secrets, destination) {
+            return Err("credentials_externally_managed");
+        }
+        credentials::remove(&self.root, id)?;
+        app.broadcast("notifications", Value::Null);
+        Ok(())
     }
     pub fn reset_due(&self, acct: &Account, now: chrono::DateTime<Utc>) -> bool {
         let inner = self.inner.lock();
@@ -584,6 +670,7 @@ pub async fn worker(app: Arc<App>) {
                             &service.secrets,
                             &service.private_endpoints,
                             service.ca_file.as_deref(),
+                            &service.root,
                             &d,
                             &p.event,
                             &presentation,

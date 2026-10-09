@@ -244,6 +244,105 @@ function notificationActivityHTML() {
         <td class="mono">${esc(row.attempt)}</td><td>${esc(row.outcome)}${row.detail ? `<small>${esc(row.detail)}</small>` : ''}${row.http_status ? `<small>HTTP ${esc(row.http_status)}</small>` : ''}</td></tr>`).join('')}</tbody></table></div>` : '<p class="cfg-empty">No delivery attempts to show yet. Save a destination and send a test to check its setup.</p>'}`;
 }
 
+function notificationCredentialSecure() {
+  return location.protocol === 'https:' || ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
+}
+
+function notificationCredentialControls(d, saved, index) {
+  const n = S.notifications;
+  const dirty = configDirty() || rawDirty();
+  const disabled = dirty || !!n.busy;
+  const message = n.credentialMsg?.id === d.id ? n.credentialMsg : null;
+  const note = `<p class="msg ${message?.kind || ''}" data-credential-message role="status" ${message ? '' : 'hidden'}>${esc(message?.text || '')}</p>`;
+  if (!saved) return `<p class="cfg-description">${dirty ? 'Save this destination before adding credentials.' : 'Loading credential status…'}</p>${note}`;
+  if (saved.credential_source === 'external') return `<p class="cfg-description">Externally managed · ${saved.credential_ready ? 'Credentials available' : 'Credentials missing or invalid'}. Update the server-provisioned files or environment variables.</p>${note}`;
+  if (!saved.credential_editable) return `<p class="cfg-description">Manage credentials with server-provisioned files or environment variables on this server.</p>${note}`;
+  if (!notificationCredentialSecure()) return `<p class="cfg-description">Open this dashboard over HTTPS or localhost to enter credentials.</p>${note}`;
+  if (n.credentialEditor === d.id) return `<div data-credential-editor="${esc(d.id)}">
+      <p class="cfg-description">Enter new credentials. Saved values are never shown. Saving replaces the URL and bearer token; leave the token blank when it is not needed.</p>
+      <div class="cfg-grid"><div class="field"><label for="notification-url-${index}">Webhook URL</label>
+        <input id="notification-url-${index}" data-credential-url type="password" required maxlength="8192" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="https://…"></div>
+      <div class="field"><label for="notification-bearer-${index}">Bearer token (optional)</label>
+        <input id="notification-bearer-${index}" data-credential-bearer type="password" maxlength="8192" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Leave blank when not needed"></div></div>
+      <div class="cfg-foot-actions"><button type="button" class="btn small primary" data-config-act="save-notification-credentials" data-destination="${esc(d.id)}" ${disabled ? 'disabled' : ''}>Save credentials</button>
+        <button type="button" class="btn small ghost" data-config-act="cancel-notification-credentials">Cancel</button></div></div>${note}`;
+  if (n.credentialRemove === d.id) return `<p class="cfg-description">Remove credentials for this destination? Notifications cannot be delivered until you add credentials again.</p>
+      <div class="cfg-foot-actions"><button type="button" class="btn small danger" data-config-act="confirm-remove-notification-credentials" data-destination="${esc(d.id)}" ${disabled ? 'disabled' : ''}>Remove</button>
+        <button type="button" class="btn small ghost" data-config-act="cancel-notification-credentials">Keep credentials</button></div>${note}`;
+  return `<p class="cfg-description">${saved.credential_configured ? (saved.credential_ready ? 'Configured' : 'Configured · credentials invalid') : 'Not configured'} · Saved credentials stay private on the server.</p>
+    <div class="cfg-foot-actions"><button type="button" class="btn small" data-config-act="edit-notification-credentials" data-destination="${esc(d.id)}" ${disabled ? 'disabled' : ''}>${saved.credential_configured ? 'Replace credentials' : 'Add credentials'}</button>
+      ${saved.credential_configured ? `<button type="button" class="btn small ghost danger" data-config-act="remove-notification-credentials" data-destination="${esc(d.id)}" ${disabled ? 'disabled' : ''}>Remove credentials</button>` : ''}</div>${note}`;
+}
+
+async function mutateNotificationCredentials(id, method, body) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (S.key) headers.Authorization = `Bearer ${S.key}`;
+  const response = await fetch(`/api/notifications/${encodeURIComponent(id)}/credentials`, { method, headers, body, cache: 'no-store', credentials: 'same-origin' });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    const messages = {
+      credential_https_required: 'Use HTTPS. If you use a reverse proxy, its address must be trusted by the server.',
+      credential_authorization_header_required: 'Unlock the dashboard again before updating credentials.',
+      credential_origin_mismatch: 'The dashboard address does not match the secure server address. Check the reverse proxy settings.',
+      credential_cross_site_request_rejected: 'Open this dashboard directly to update credentials.',
+      credentials_externally_managed: 'These credentials are managed through server files or environment variables.',
+      destination_unavailable: 'Save this destination before adding credentials.',
+      invalid_url: 'Enter a complete HTTPS webhook URL.',
+      unsafe_url: 'Use an HTTPS webhook URL without a username, password or fragment.',
+      invalid_bearer: 'Enter a bearer token without line breaks.',
+      credential_too_large: 'The webhook URL and bearer token must each be at most 8 KiB.',
+      credential_body_too_large: 'The credential request is too large.',
+      insecure_credential_directory: 'The server credential directory needs private ownership and permissions.',
+      insecure_credential_file: 'The server credential file needs private ownership and permissions.',
+      credential_unavailable: 'The server could not access its private credential storage.',
+    };
+    // Only known messages enter page state, even if a proxy returns an unexpected response.
+    throw new ApiError(response.status, Object.hasOwn(messages, data.error) ? messages[data.error] : 'Credentials could not be updated. Check the server connection and credential storage.');
+  }
+}
+
+async function saveNotificationCredentials(id) {
+  const n = S.notifications;
+  if (n.busy || configDirty() || rawDirty()) return;
+  const editor = document.querySelector(`[data-credential-editor="${CSS.escape(id)}"]`);
+  if (!editor) return;
+  const urlInput = editor.querySelector('[data-credential-url]');
+  const tokenInput = editor.querySelector('[data-credential-bearer]');
+  urlInput.setCustomValidity(''); tokenInput.setCustomValidity('');
+  let url = urlInput.value.trim(); let bearer = tokenInput.value.trim();
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.hash || new TextEncoder().encode(url).length > 8192) throw new Error();
+  } catch { urlInput.setCustomValidity('Enter a complete HTTPS webhook URL without a username, password or fragment.'); urlInput.reportValidity(); return; }
+  if (/[\r\n]/.test(bearer) || new TextEncoder().encode(bearer).length > 8192) {
+    tokenInput.setCustomValidity('Enter a bearer token up to 8 KiB without line breaks.'); tokenInput.reportValidity(); return;
+  }
+  // Secrets live only in these inputs and the request, never in config drafts or browser storage.
+  let body = JSON.stringify({ url, bearer_token: bearer });
+  urlInput.value = ''; tokenInput.value = ''; url = ''; bearer = '';
+  n.busy = `credentials:${id}`; n.credentialEditor = null; n.credentialRemove = null; n.credentialMsg = null; render();
+  try {
+    const request = mutateNotificationCredentials(id, 'PUT', body); body = ''; await request;
+    n.credentialMsg = { id, kind: 'ok', text: 'Credentials saved. Send a test notification to check delivery.' };
+  } catch (e) { n.credentialMsg = { id, kind: 'err', text: e.message === 'Failed to fetch' ? 'Could not reach the server. Enter credentials again to retry.' : e.message }; }
+  finally { body = ''; n.busy = null; }
+  await loadNotifications();
+  if (S.route === 'config' && S.config.section === 'notifications') render();
+}
+
+async function removeNotificationCredentials(id) {
+  const n = S.notifications;
+  if (n.busy || configDirty() || rawDirty()) return;
+  n.busy = `credentials:${id}`; n.credentialRemove = null; n.credentialMsg = null; render();
+  try {
+    await mutateNotificationCredentials(id, 'DELETE');
+    n.credentialMsg = { id, kind: 'ok', text: 'Credentials removed.' };
+  } catch (e) { n.credentialMsg = { id, kind: 'err', text: e.message }; }
+  n.busy = null;
+  await loadNotifications();
+  if (S.route === 'config' && S.config.section === 'notifications') render();
+}
+
 function configNotificationsHTML() {
   const list = configGet(['notifications', 'destinations']) || [];
   const n = S.notifications;
@@ -255,8 +354,9 @@ function configNotificationsHTML() {
     <div class="cfg-grid">${configSelect(['notifications', 'time-zone'], 'Notification time zone', notificationTimeZones(), { help: 'Use this time zone for observed and estimated reset times. Daylight saving changes apply automatically; no restart needed.' })}</div>
     <button type="button" class="btn ghost small" data-config-act="notification-browser-zone">Use browser time zone</button>
     ${configSwitch(['notifications', 'provider-logos'], 'Provider logos', 'Add a Claude or ChatGPT logo thumbnail to Discord quota alerts. Test messages preview both logos. Other platforms keep their existing message format.')}
-    <details class="cfg-advanced"><summary>Set up credentials<span class="cfg-chevron" aria-hidden="true">›</span></summary>
-      <p class="cfg-description">Credentials stay on the server. Choose a credential ID below, then provision its webhook URL in a private file named <code>&lt;id&gt;.url</code> in the server's notification secrets directory. An optional <code>&lt;id&gt;.bearer</code> file supplies a bearer token.</p>
+    <p class="cfg-description">Save a destination, then add its webhook URL and optional bearer token below. Credentials are saved separately from config.yaml and cannot be retrieved through the dashboard.</p>
+    <details class="cfg-advanced"><summary>Advanced credential setup<span class="cfg-chevron" aria-hidden="true">›</span></summary>
+      <p class="cfg-description">For server-provisioned credentials, use a private file named <code>&lt;id&gt;.url</code> in the notification secrets directory. An optional <code>&lt;id&gt;.bearer</code> file supplies a bearer token. These credentials are managed outside the dashboard.</p>
       <p class="cfg-description">The default directory is <code>.notification-secrets</code> inside your credentials directory. Alternatively, set <code>CLIPROXYAPI_NOTIFY_&lt;ID&gt;_URL</code> and optional <code>CLIPROXYAPI_NOTIFY_&lt;ID&gt;_BEARER_TOKEN</code> before starting the server; uppercase the ID and replace hyphens with underscores. Files must have private permissions. Self-hosted private destinations need operator-configured network permissions and a restart.</p>
       <p class="cfg-description">Telegram uses its full <code>sendMessage</code> URL as the secret, plus a chat ID below. Teams uses a Workflows webhook that accepts Adaptive Cards. Setup and troubleshooting: <code>docs/notifications.md</code>.</p></details>
     ${list.length ? list.map((d, i) => {
@@ -264,13 +364,14 @@ function configNotificationsHTML() {
       const saved = n.status?.destinations?.find((row) => row.id === d.id);
       const canTest = !configDirty() && !rawDirty() && n.status?.enabled && saved?.enabled && saved?.credential_ready && !n.busy;
       return `<section class="notification-destination" aria-label="Destination ${i + 1}"><div class="cfg-list-head"><h3>Destination ${i + 1}</h3>${configRemove(path, `Remove destination ${i + 1}`)}</div>
-        <div class="cfg-grid">${configField([...path, 'id'], 'Credential ID', { required: true, placeholder: 'ops-discord', help: 'Unique lowercase letters, numbers and hyphens; up to 32 characters. This selects credentials provisioned on the server.' })}
+        <div class="cfg-grid">${configField([...path, 'id'], 'Destination ID', { required: true, placeholder: 'ops-discord', help: 'Unique lowercase letters, numbers and hyphens; up to 32 characters. Credentials are associated with this ID.' })}
           ${configSelect([...path, 'format'], 'Platform', NOTIFICATION_FORMATS)}
           ${d.format === 'telegram' ? configField([...path, 'chat-id'], 'Telegram chat ID', { required: true, placeholder: '-1001234567890', help: 'The chat or channel your bot can send messages to.' }) : ''}</div>
         ${configSwitch([...path, 'enabled'], 'Enable destination', 'Send quota events to this destination when quota notifications are on.')}
+        <div id="notification-credentials-${i}" data-notification-credentials="${esc(d.id)}">${notificationCredentialControls(d, saved, i)}</div>
         <div class="notification-test"><button type="button" class="btn small" data-config-act="test-notification" data-destination="${esc(d.id)}" ${canTest ? '' : 'disabled'}>${n.busy === d.id ? 'Sending…' : 'Send test notification'}</button>
           <span class="cfg-description" data-notification-credential="${esc(d.id)}">${configDirty() || rawDirty() ? 'Save changes before testing.' : saved ? (saved.credential_ready ? 'Credentials available' : 'Credentials missing or invalid') : 'Save this destination to check its credentials.'}</span></div></section>`;
-    }).join('') : '<div class="cfg-empty-state"><h3>No destinations configured</h3><p>Add a destination, choose its platform and provision its named credentials on the server.</p></div>'}
+    }).join('') : '<div class="cfg-empty-state"><h3>No destinations configured</h3><p>Add a destination, choose its platform and save. Then add credentials and send a test notification.</p></div>'}
     ${n.testMsg ? `<p class="msg ${n.testMsg.kind}" role="status">${esc(n.testMsg.text)}</p>` : ''}
     <div class="cfg-divider"></div><div id="notification-activity">${notificationActivityHTML()}</div>`;
 }
@@ -299,9 +400,23 @@ function patchNotificationActivity() {
 
 function updateNotificationActions() {
   const n = S.notifications;
+  const dirty = configDirty() || rawDirty();
+  const destinations = configGet(['notifications', 'destinations']) || [];
+  for (const [index, d] of destinations.entries()) {
+    const panel = document.getElementById(`notification-credentials-${index}`);
+    if (!panel || n.credentialEditor === d.id || n.credentialRemove === d.id) continue;
+    const saved = n.status?.destinations?.find((row) => row.id === d.id);
+    const signature = JSON.stringify([d.id, saved?.credential_source, saved?.credential_configured, saved?.credential_ready, saved?.credential_editable, dirty, n.busy, n.credentialMsg]);
+    if (panel.dataset.signature !== signature) {
+      panel.innerHTML = notificationCredentialControls(d, saved, index);
+      panel.dataset.signature = signature;
+    }
+  }
+  for (const button of document.querySelectorAll('[data-config-act="save-notification-credentials"], [data-config-act="confirm-remove-notification-credentials"]')) {
+    button.disabled = dirty || !!n.busy;
+  }
   for (const button of document.querySelectorAll('[data-config-act="test-notification"]')) {
     const saved = n.status?.destinations?.find((row) => row.id === button.dataset.destination);
-    const dirty = configDirty() || rawDirty();
     button.disabled = dirty || !n.status?.enabled || !saved?.enabled || !saved?.credential_ready || !!n.busy;
     const note = button.parentElement.querySelector('[data-notification-credential]');
     if (note) note.textContent = dirty ? 'Save changes before testing.' : saved ? (saved.credential_ready ? 'Credentials available' : 'Credentials missing or invalid') : 'Save this destination to check its credentials.';
@@ -575,7 +690,11 @@ function bindConfig() {
       S.config.raw.text = ta.value; configUpdateFoot();
     }
   });
-  form.addEventListener('submit', (e) => { e.preventDefault(); saveConfig(); });
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const editor = document.activeElement?.closest('[data-credential-editor]');
+    if (editor) saveNotificationCredentials(editor.dataset.credentialEditor); else saveConfig();
+  });
   form.addEventListener('input', (e) => {
     const input = e.target.closest('[data-cfg]');
     if (!input) return;
@@ -644,6 +763,17 @@ document.addEventListener('click', (e) => {
   if (act === 'save') return saveConfig();
   if (act === 'refresh-notifications') return loadNotifications();
   if (act === 'test-notification') return testNotification(button.dataset.destination);
+  if (act === 'save-notification-credentials') return saveNotificationCredentials(button.dataset.destination);
+  if (act === 'confirm-remove-notification-credentials') return removeNotificationCredentials(button.dataset.destination);
+  if (act === 'edit-notification-credentials' || act === 'remove-notification-credentials' || act === 'cancel-notification-credentials') {
+    const n = S.notifications;
+    if (n.busy || ((configDirty() || rawDirty()) && act !== 'cancel-notification-credentials')) return;
+    n.credentialEditor = act === 'edit-notification-credentials' ? button.dataset.destination : null;
+    n.credentialRemove = act === 'remove-notification-credentials' ? button.dataset.destination : null;
+    n.credentialMsg = null; render();
+    document.querySelector('[data-credential-url]')?.focus();
+    return;
+  }
   if (act === 'notification-browser-zone') {
     const zone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
     configSet(['notifications', 'time-zone'], zone); c.msg = null; render();
