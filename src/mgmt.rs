@@ -292,6 +292,8 @@ pub fn router(app: Arc<App>) -> Router<Arc<App>> {
         .route("/vertex", post(import_vertex))
         .route("/requests", get(requests))
         .route("/models", get(models))
+        .route("/notifications", get(notification_status))
+        .route("/notifications/{id}/test", post(test_notification))
         .route("/config", get(get_config).put(put_config))
         .route("/config/settings", get(get_settings).patch(patch_settings))
         .route("/login/{target}", post(login_start).get(login_status))
@@ -663,6 +665,21 @@ fn edit_config(app: &Arc<App>, edit: impl FnOnce(&mut serde_yaml::Value)) -> Res
 async fn get_config(State(app): State<Arc<App>>) -> Json<Value> {
     let text = std::fs::read_to_string(&app.cfg_path).unwrap_or_default();
     Json(json!({ "text": text, "path": app.cfg_path.display().to_string() }))
+}
+
+async fn notification_status(State(app): State<Arc<App>>) -> Json<Value> {
+    Json(app.notifications.status(&app))
+}
+
+// JSON prevents ordinary cross-origin forms from triggering a localhost send.
+async fn test_notification(State(app): State<Arc<App>>, Path(id): Path<String>, Json(body): Json<Value>) -> Response {
+    if !body.as_object().is_some_and(|value| value.is_empty()) {
+        return err(StatusCode::BAD_REQUEST, "Send an empty JSON object to test a configured destination");
+    }
+    match app.notifications.test(&app, &id).await {
+        Ok(value) => Json(value).into_response(),
+        Err(message) => err(StatusCode::BAD_REQUEST, message),
+    }
 }
 
 #[derive(Deserialize)]

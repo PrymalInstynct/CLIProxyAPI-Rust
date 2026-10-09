@@ -11,6 +11,9 @@ mod formats;
 mod ir;
 mod media;
 mod mgmt;
+#[cfg(test)]
+mod notification_integration_tests;
+mod notifications;
 mod oauth;
 mod proxy;
 mod quota;
@@ -123,6 +126,7 @@ async fn serve(app: Arc<App>) -> Result<()> {
     tokio::spawn(oauth::refresher(app.clone()));
     tokio::spawn(antigravity::version_updater(app.clone()));
     tokio::spawn(quota::poller(app.clone()));
+    tokio::spawn(notifications::worker(app.clone()));
     tokio::spawn(watch(app.clone()));
 
     let scheme = if cfg.tls.enable { "https" } else { "http" };

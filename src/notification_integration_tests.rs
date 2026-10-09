@@ -1,0 +1,187 @@
+use axum::http::StatusCode;
+use serde_json::{Value, json};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+struct Temp(PathBuf);
+
+impl Temp {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("notification-integration-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).unwrap();
+        let path = std::fs::canonicalize(path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for Temp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn app(temp: &Temp, enabled: bool, secrets_dir: Option<&Path>) -> Arc<crate::state::App> {
+    let mut cfg = crate::config::Config {
+        auth_dir: temp.0.join("auth").to_string_lossy().into_owned(),
+        management_key: "notification-test-management-key".into(),
+        ..Default::default()
+    };
+    cfg.notifications.enabled = enabled;
+    cfg.notifications.secrets_dir = secrets_dir.map(|p| p.to_string_lossy().into_owned());
+    cfg.notifications.destinations.push(crate::notifications::Destination {
+        id: "ops".into(),
+        format: crate::notifications::Format::Discord,
+        enabled: true,
+        chat_id: None,
+    });
+    std::fs::create_dir_all(cfg.auth_dir()).unwrap();
+    crate::state::App::new(cfg, temp.0.join("config.yaml"))
+}
+
+fn private_file(path: &Path, contents: &str) {
+    std::fs::write(path, contents).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+struct TestServer(tokio::task::JoinHandle<()>);
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn serve(app: Arc<crate::state::App>) -> (String, TestServer) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let router = crate::mgmt::router(app.clone()).with_state(app);
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+    });
+    (origin, TestServer(task))
+}
+
+#[tokio::test]
+async fn notification_test_blocks_loopback_and_persists_only_sanitized_details() {
+    let temp = Temp::new();
+    let secrets = temp.0.join("secrets");
+    std::fs::create_dir_all(&secrets).unwrap();
+    let sentinel_url = "https://127.0.0.1:9/sentinel-notification-url";
+    let sentinel_token = "sentinel-notification-bearer";
+    private_file(&secrets.join("ops.url"), sentinel_url);
+    private_file(&secrets.join("ops.bearer"), sentinel_token);
+    let app = app(&temp, true, Some(&secrets));
+
+    let (origin, _server) = serve(app.clone()).await;
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{origin}/notifications/ops/test"))
+        .bearer_auth("notification-test-management-key")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"], "blocked_address");
+
+    let status = client
+        .get(format!("{origin}/notifications"))
+        .bearer_auth("notification-test-management-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    let status: Value = status.json().await.unwrap();
+    assert_eq!(status["logs"][0]["detail"], "blocked_address");
+    assert_eq!(status["logs"][0]["outcome"], "terminal_failure");
+    let state = std::fs::read(temp.0.join("auth/.quota-notifications/state.json")).unwrap();
+    let persisted = String::from_utf8(state).unwrap();
+    for secret in [sentinel_url, sentinel_token] {
+        assert!(!persisted.contains(secret));
+        assert!(!status.to_string().contains(secret));
+    }
+}
+
+#[tokio::test]
+async fn notification_management_requires_key_and_test_rejects_form_content_type() {
+    let temp = Temp::new();
+    let app = app(&temp, false, None);
+    let (origin, _server) = serve(app.clone()).await;
+    let client = reqwest::Client::new();
+
+    let unauthenticated = client.get(format!("{origin}/notifications")).send().await.unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let form = client
+        .post(format!("{origin}/notifications/ops/test"))
+        .bearer_auth("notification-test-management-key")
+        .header(reqwest::header::ORIGIN, "https://attacker.invalid")
+        .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body("")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(form.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert!(!temp.0.join("auth/.quota-notifications").exists());
+}
+
+#[test]
+fn notification_config_rejects_inline_url_credentials() {
+    let error = crate::config::Config::parse(
+        "notifications:\n  enabled: true\n  destinations:\n    - id: ops\n      format: discord\n      url: https://example.invalid/secret-sentinel\n",
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("unknown field"));
+}
+
+#[tokio::test]
+async fn hot_config_cannot_expand_startup_notification_secret_access() {
+    let temp = Temp::new();
+    let startup_secrets = temp.0.join("startup-secrets");
+    let runtime_secrets = temp.0.join("runtime-secrets");
+    std::fs::create_dir_all(&startup_secrets).unwrap();
+    std::fs::create_dir_all(&runtime_secrets).unwrap();
+    // A runtime-only URL must never be used: keep it loopback so even a regression
+    // cannot make this test contact an external service.
+    private_file(&runtime_secrets.join("ops.url"), "https://127.0.0.1:9/hook");
+
+    let app = app(&temp, true, Some(&startup_secrets));
+    let mut hot = (*app.cfg()).clone();
+    hot.notifications.secrets_dir = Some(runtime_secrets.to_string_lossy().into_owned());
+    hot.notifications.private_endpoints = vec![crate::notifications::PrivateEndpoint {
+        host: "127.0.0.1".into(),
+        port: 443,
+        cidrs: vec!["127.0.0.1/32".into()],
+    }];
+    app.set_config(hot);
+
+    let status = app.notifications.status(&app);
+    assert_eq!(status["destinations"][0]["credential_ready"], false);
+    let result = app.notifications.test(&app, "ops").await;
+    assert_eq!(result.unwrap_err(), "credential_unavailable");
+    let state = std::fs::read_to_string(temp.0.join("auth/.quota-notifications/state.json")).unwrap();
+    assert!(state.contains("credential_unavailable"));
+}
+
+#[tokio::test]
+async fn status_does_not_create_notification_state_when_feature_is_disabled() {
+    let temp = Temp::new();
+    let app = app(&temp, false, None);
+    let (origin, _server) = serve(app).await;
+    let response = reqwest::Client::new()
+        .get(format!("{origin}/notifications"))
+        .bearer_auth("notification-test-management-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let status: Value = response.json().await.unwrap();
+    assert_eq!(status["enabled"], false);
+    assert!(!temp.0.join("auth/.quota-notifications").exists());
+}

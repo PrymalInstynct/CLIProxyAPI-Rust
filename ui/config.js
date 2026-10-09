@@ -2,7 +2,7 @@
 
 const CONFIG_SECTIONS = [
   ['server', 'Server'], ['access', 'Access'], ['routing', 'Routing'], ['connections', 'Connections'],
-  ['providers', 'Providers'], ['models', 'Models'], ['diagnostics', 'Diagnostics'], ['yaml', 'YAML file'],
+  ['providers', 'Providers'], ['models', 'Models'], ['notifications', 'Notifications'], ['diagnostics', 'Diagnostics'], ['yaml', 'YAML file'],
 ];
 const CONFIG_PROVIDERS = [
   ['claude', 'Claude', 'claude-api-key'], ['codex', 'OpenAI / Codex', 'codex-api-key'],
@@ -211,6 +211,98 @@ function configDiagnosticsHTML() {
     ${S.config.ignored.length ? `<p class="cfg-description">These settings are retained in the file but have no effect in CLIProxyAPI-Rust.</p><ul class="cfg-notices">${S.config.ignored.map((s) => `<li>${esc(s)}</li>`).join('')}</ul>` : '<p class="cfg-description">No ignored CLIProxyAPI features were detected.</p>'}`;
 }
 
+const NOTIFICATION_FORMATS = [['generic', 'Generic webhook'], ['discord', 'Discord'], ['slack', 'Slack'],
+  ['mattermost', 'Mattermost'], ['teams', 'Microsoft Teams'], ['telegram', 'Telegram']];
+
+function notificationActivityHTML() {
+  const n = S.notifications;
+  const status = n.status;
+  const logs = (status?.logs || []).filter((row) => !n.filter || row.destination === n.filter);
+  return `<div class="cfg-section-head"><h3>Delivery activity</h3><button type="button" class="btn ghost small" data-config-act="refresh-notifications" ${n.loading ? 'disabled' : ''}>${n.loading ? 'Refreshing…' : 'Refresh activity'}</button></div>
+    ${n.error ? `<p class="msg err" role="alert">${esc(n.error)}</p>` : ''}
+    ${status ? `<p class="cfg-description" role="status">${status.enabled ? (status.active ? 'Monitoring active' : 'Monitoring unavailable') : 'Notifications off'} · ${fmt(status.pending)} pending deliveries${status.error ? ` · ${esc(status.error)}` : ''}</p>${status.warning ? `<p class="msg warn" role="status">${esc(status.warning)}</p>` : ''}` : '<p class="cfg-description">Loading delivery status…</p>'}
+    <p class="cfg-description">Recent attempts show safe status details. Activity refreshes every five seconds while this section is open.</p>
+    <div class="field cfg-provider-select"><label for="notification-log-filter">Destination</label><select id="notification-log-filter" data-notification-filter><option value="">All destinations</option>
+      ${[...new Set([...(status?.destinations || []).map((d) => d.id), ...(status?.logs || []).map((row) => row.destination)])].map((id) => `<option value="${esc(id)}" ${n.filter === id ? 'selected' : ''}>${esc(id)}</option>`).join('')}</select></div>
+    ${logs.length ? `<div class="table-wrap notification-log"><table><thead><tr><th>Time</th><th>Destination / event</th><th>Subscription / window</th><th>Attempt</th><th>Outcome</th></tr></thead><tbody>
+      ${logs.map((row) => `<tr><td class="mono" title="${esc(row.timestamp)}">${esc(row.timestamp ? new Date(row.timestamp).toLocaleString() : '—')}</td>
+        <td>${esc(row.destination)}<small>${esc(row.event)}</small></td><td class="mono">${esc(row.subscription || '—')}<small>${esc(row.window || '—')}</small></td>
+        <td class="mono">${esc(row.attempt)}</td><td>${esc(row.outcome)}${row.detail ? `<small>${esc(row.detail)}</small>` : ''}${row.http_status ? `<small>HTTP ${esc(row.http_status)}</small>` : ''}</td></tr>`).join('')}</tbody></table></div>` : '<p class="cfg-empty">No delivery attempts to show yet. Save a destination and send a test to check its setup.</p>'}`;
+}
+
+function configNotificationsHTML() {
+  const list = configGet(['notifications', 'destinations']) || [];
+  const n = S.notifications;
+  if (!n.status && !n.loading && !n.error) loadNotifications();
+  return `<div class="cfg-section-head"><h2>Notifications</h2><button type="button" class="btn" data-config-act="add-notification">Add destination</button></div>
+    <p class="cfg-description">Get an alert when a Claude or Codex subscription hits a quota, and another when fresh provider data confirms it has recovered. A weekly limit can still block a recovered 5-hour window.</p>
+    ${configSwitch(['notifications', 'enabled'], 'Quota notifications', 'Monitor all enabled Claude and Codex subscriptions, including idle accounts. Other providers do not yet expose supported quota monitoring.')}
+    <details class="cfg-advanced"><summary>Set up credentials<span class="cfg-chevron" aria-hidden="true">›</span></summary>
+      <p class="cfg-description">Credentials stay on the server. Choose a credential ID below, then provision its webhook URL in a private file named <code>&lt;id&gt;.url</code> in the server's notification secrets directory. An optional <code>&lt;id&gt;.bearer</code> file supplies a bearer token.</p>
+      <p class="cfg-description">The default directory is <code>.notification-secrets</code> inside your credentials directory. Alternatively, set <code>CLIPROXYAPI_NOTIFY_&lt;ID&gt;_URL</code> and optional <code>CLIPROXYAPI_NOTIFY_&lt;ID&gt;_BEARER_TOKEN</code> before starting the server; uppercase the ID and replace hyphens with underscores. Files must have private permissions. Self-hosted private destinations need operator-configured network permissions and a restart.</p>
+      <p class="cfg-description">Telegram uses its full <code>sendMessage</code> URL as the secret, plus a chat ID below. Teams uses a Workflows webhook that accepts Adaptive Cards. Setup and troubleshooting: <code>docs/notifications.md</code>.</p></details>
+    ${list.length ? list.map((d, i) => {
+      const path = ['notifications', 'destinations', i];
+      const saved = n.status?.destinations?.find((row) => row.id === d.id);
+      const canTest = !configDirty() && !rawDirty() && n.status?.enabled && saved?.enabled && saved?.credential_ready && !n.busy;
+      return `<section class="notification-destination" aria-label="Destination ${i + 1}"><div class="cfg-list-head"><h3>Destination ${i + 1}</h3>${configRemove(path, `Remove destination ${i + 1}`)}</div>
+        <div class="cfg-grid">${configField([...path, 'id'], 'Credential ID', { required: true, placeholder: 'ops-discord', help: 'Unique lowercase letters, numbers and hyphens; up to 32 characters. This selects credentials provisioned on the server.' })}
+          ${configSelect([...path, 'format'], 'Platform', NOTIFICATION_FORMATS)}
+          ${d.format === 'telegram' ? configField([...path, 'chat-id'], 'Telegram chat ID', { required: true, placeholder: '-1001234567890', help: 'The chat or channel your bot can send messages to.' }) : ''}</div>
+        ${configSwitch([...path, 'enabled'], 'Enable destination', 'Send quota events to this destination when quota notifications are on.')}
+        <div class="notification-test"><button type="button" class="btn small" data-config-act="test-notification" data-destination="${esc(d.id)}" ${canTest ? '' : 'disabled'}>${n.busy === d.id ? 'Sending…' : 'Send test notification'}</button>
+          <span class="cfg-description" data-notification-credential="${esc(d.id)}">${configDirty() || rawDirty() ? 'Save changes before testing.' : saved ? (saved.credential_ready ? 'Credentials available' : 'Credentials missing or invalid') : 'Save this destination to check its credentials.'}</span></div></section>`;
+    }).join('') : '<div class="cfg-empty-state"><h3>No destinations configured</h3><p>Add a destination, choose its platform and provision its named credentials on the server.</p></div>'}
+    ${n.testMsg ? `<p class="msg ${n.testMsg.kind}" role="status">${esc(n.testMsg.text)}</p>` : ''}
+    <div class="cfg-divider"></div><div id="notification-activity">${notificationActivityHTML()}</div>`;
+}
+
+async function loadNotifications() {
+  const n = S.notifications;
+  if (n.loading || S.locked) return;
+  n.loading = true;
+  try { n.status = await api('/notifications'); n.error = null; }
+  catch (e) { n.error = e.message; }
+  n.loading = false;
+  if (S.route === 'config' && S.config.section === 'notifications') {
+    patchNotificationActivity();
+    updateNotificationActions();
+  }
+}
+
+function patchNotificationActivity() {
+  const focus = document.activeElement?.id;
+  const scroll = document.querySelector('.notification-log')?.scrollTop || 0;
+  patch('notification-activity', notificationActivityHTML);
+  const log = document.querySelector('.notification-log');
+  if (log) log.scrollTop = scroll;
+  if (focus === 'notification-log-filter') document.getElementById(focus)?.focus({ preventScroll: true });
+}
+
+function updateNotificationActions() {
+  const n = S.notifications;
+  for (const button of document.querySelectorAll('[data-config-act="test-notification"]')) {
+    const saved = n.status?.destinations?.find((row) => row.id === button.dataset.destination);
+    const dirty = configDirty() || rawDirty();
+    button.disabled = dirty || !n.status?.enabled || !saved?.enabled || !saved?.credential_ready || !!n.busy;
+    const note = button.parentElement.querySelector('[data-notification-credential]');
+    if (note) note.textContent = dirty ? 'Save changes before testing.' : saved ? (saved.credential_ready ? 'Credentials available' : 'Credentials missing or invalid') : 'Save this destination to check its credentials.';
+  }
+}
+
+async function testNotification(id) {
+  const n = S.notifications;
+  if (n.busy || configDirty() || rawDirty()) return;
+  n.busy = id; n.testMsg = null; render();
+  try {
+    const result = await api(`/notifications/${encodeURIComponent(id)}/test`, { method: 'POST', body: '{}' });
+    n.testMsg = { kind: 'ok', text: result.delivered ? 'Test notification delivered.' : 'Check delivery activity for the test outcome.' };
+  } catch (e) { n.testMsg = { kind: 'err', text: e.message }; }
+  n.busy = null;
+  await loadNotifications();
+  if (S.route === 'config') render();
+}
+
 // The whole file, for settings the sections don't cover. One kind of edit at a time:
 // form drafts and YAML drafts never pile up on top of each other.
 const rawDirty = () => S.config.raw.text != null && S.config.raw.text !== S.config.raw.saved;
@@ -287,7 +379,7 @@ function configHTML() {
     return skeletonHTML();
   }
   const sections = { server: configServerHTML, access: configAccessHTML, routing: configRoutingHTML,
-    connections: configConnectionsHTML, providers: configProvidersHTML, models: configModelsHTML, diagnostics: configDiagnosticsHTML, yaml: configYamlHTML };
+    connections: configConnectionsHTML, providers: configProvidersHTML, models: configModelsHTML, notifications: configNotificationsHTML, diagnostics: configDiagnosticsHTML, yaml: configYamlHTML };
   return `<div class="page-head"><div><h1>Configuration</h1><p class="mono cfg-path">${esc(home(c.path))}</p></div>
       <button type="button" class="btn ghost" data-config-act="reload" ${c.busy ? 'disabled' : ''}>Reload settings</button></div>
     ${c.reloadConfirm ? '<div class="cfg-banner"><span>Reloading will discard your unsaved changes.</span><button class="btn small" data-config-act="confirm-reload">Reload and discard</button><button class="btn ghost small" data-config-act="cancel-reload">Keep editing</button></div>' : ''}
@@ -319,6 +411,7 @@ async function loadConfig() {
 function configUpdateFoot() {
   const foot = $('#config-foot');
   if (foot) foot.innerHTML = configFootHTML();
+  updateNotificationActions();
 }
 
 function configError(path, message) {
@@ -362,6 +455,15 @@ function configValidate() {
     if (!v.tls.key?.trim()) invalid(['tls', 'key'], 'Enter a private key path.');
   }
   if ('proxy-url' in changed) checkURL(['proxy-url'], true);
+  if ('notifications' in changed) {
+    const ids = new Set();
+    (v.notifications.destinations || []).forEach((d, i) => {
+      const path = ['notifications', 'destinations', i];
+      if (!/^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/.test(d.id || '') || ids.has(d.id)) invalid([...path, 'id'], 'Enter a unique ID: lowercase letters, numbers and internal hyphens, up to 32 characters.');
+      ids.add(d.id);
+      if (d.format === 'telegram' && !d['chat-id']?.trim()) invalid([...path, 'chat-id'], 'Enter a Telegram chat ID.');
+    });
+  }
   for (const [provider, , field] of CONFIG_PROVIDERS) {
     if (!(field in changed)) continue;
     (v[field] || []).forEach((entry, i) => {
@@ -397,6 +499,7 @@ function configValidate() {
       } else if (path[0] === 'api-keys') c.section = 'access';
       else if (['request-retry', 'session-affinity-idle-seconds', 'five-hour-reserve-percent'].includes(path[0])) c.section = 'routing';
       else if (path[0] === 'proxy-url') c.section = 'connections';
+      else if (path[0] === 'notifications') c.section = 'notifications';
       else c.section = 'server';
     }
     render(); document.getElementById(id)?.focus(); return false;
@@ -424,6 +527,7 @@ async function saveConfig() {
       ws?.close();
     }
     refreshAccounts();
+    if (c.section === 'notifications') loadNotifications();
   } catch (e) { c.msg = { kind: 'err', text: e.message }; }
   c.busy = false; render();
 }
@@ -462,7 +566,7 @@ function bindConfig() {
     if (input.dataset.secret) S.config.secrets[JSON.stringify(path)] = true;
     configSet(path, value);
     configError(path, ''); S.config.msg = null;
-    if (path[0] === 'routing') { render(); document.getElementById(input.id)?.focus(); }
+    if (path[0] === 'routing' || (path[0] === 'notifications' && path.at(-1) === 'format')) { render(); document.getElementById(input.id)?.focus(); }
     else configUpdateFoot();
   });
   const updateHeaderName = (e) => {
@@ -499,6 +603,9 @@ function bindConfig() {
   };
   form.addEventListener('input', updateHeaderName);
   form.addEventListener('change', updateHeaderName);
+  form.addEventListener('change', (e) => {
+    if (e.target.matches('[data-notification-filter]')) { S.notifications.filter = e.target.value; patchNotificationActivity(); }
+  });
   form.addEventListener('toggle', (e) => {
     if (e.target.dataset.cfgOpen) S.config.opens[e.target.dataset.cfgOpen] = e.target.open;
   }, true);
@@ -515,6 +622,8 @@ document.addEventListener('click', (e) => {
   const act = button.dataset.configAct;
   const path = button.dataset.path ? JSON.parse(button.dataset.path) : null;
   if (act === 'save') return saveConfig();
+  if (act === 'refresh-notifications') return loadNotifications();
+  if (act === 'test-notification') return testNotification(button.dataset.destination);
   if (act === 'discard') return discardConfig();
   if (act === 'reload') {
     if (configDirty() || rawDirty()) { c.reloadConfirm = true; render(); return; }
@@ -526,7 +635,9 @@ document.addEventListener('click', (e) => {
     if (c.section === 'yaml' && button.dataset.section !== 'yaml' && rawDirty()) {
       c.msg = { kind: 'err', text: 'Save or revert the file first.' }; configUpdateFoot(); return;
     }
-    c.section = button.dataset.section; c.msg = null; render(); $('.cfg-content h2')?.scrollIntoView({ block: 'nearest' }); return;
+    c.section = button.dataset.section; c.msg = null; render(); $('.cfg-content h2')?.scrollIntoView({ block: 'nearest' });
+    if (c.section === 'notifications') loadNotifications();
+    return;
   }
   if (act === 'provider') { c.provider = button.dataset.provider; render(); return; }
   if (act === 'switch') {
@@ -540,6 +651,11 @@ document.addEventListener('click', (e) => {
     return;
   }
   if (act === 'clear-secret') { configSet(path, ''); c.secrets[JSON.stringify(path)] = true; }
+  if (act === 'add-notification') {
+    const list = configGet(['notifications', 'destinations']) || [];
+    list.push({ id: '', format: 'discord', enabled: true });
+    configSet(['notifications', 'destinations'], list);
+  }
   if (act === 'add-provider') {
     const [provider, , field] = CONFIG_PROVIDERS.find(([p]) => p === c.provider);
     const list = c.values[field];
