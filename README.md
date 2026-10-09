@@ -239,6 +239,8 @@ Choose **Used** or **Remaining** beside the quota meters on Overview or Accounts
 
 **Banked resets** (off by default). Claude and ChatGPT sometimes give subscribers saved resets that clear a usage limit early. Turn on `banked-resets` (Config, Connections) and subscriptions that have some show a badge beside the account name; click it to see expiry dates and spend one, always with a confirmation. It relies on unofficial provider endpoints, checks every 30 minutes, and keeps a crash-safe journal so a reset is never spent twice. See [banked resets](docs/banked-resets.md).
 
+**Quota notifications** (off by default). Send confirmed Claude and Codex subscription quota exhaustion and recovery events to generic webhooks, Discord, Slack, Mattermost, Teams Workflows or Telegram. Messages use the account's current dashboard display name and local timestamps; Discord provider-logo thumbnails are bundled and on by default, with a dashboard toggle. Configure destinations and time zone in the dashboard. To enter webhook credentials, enable **Allow secret entry** and confirm the **Public dashboard URL** over HTTPS; local or native TLS setups may leave it blank. Environment variables and mounted secret files remain available for externally managed deployments. See [notification setup and troubleshooting](docs/notifications.md).
+
 <sub>Screenshots use sample data.</sub>
 
 ## Configuration
@@ -261,6 +263,10 @@ session-affinity-idle-seconds: 86400 # forget assignments after a day without re
 codex-websockets: true        # native WebSocket relay to ChatGPT
 claude-cloak: true            # present non-Claude-Code clients as Claude Code on OAuth accounts
 banked-resets: false          # show and spend banked Claude/ChatGPT limit resets (unofficial endpoints)
+notifications:
+  enabled: false              # confirmed Claude/Codex subscription quota events; see docs/notifications.md
+  time-zone: UTC              # notification timestamp display; select in Config → Notifications
+  provider-logos: true        # Discord thumbnails; toggle in Config → Notifications
 
 claude-api-key:
   - api-key: "sk-ant-..."

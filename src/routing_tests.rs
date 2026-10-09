@@ -29,6 +29,22 @@ struct Mock {
     ws_mode: Mutex<WsMode>,
     ws_rich_output: AtomicBool,
     ws_control: Mutex<Option<WsControl>>,
+    quota_gate: Mutex<Option<Arc<QuotaGate>>>,
+}
+
+#[derive(Default)]
+struct QuotaGate {
+    started: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+impl Mock {
+    async fn await_quota_gate(&self, account: &str) {
+        let gate = if account == "a" { self.quota_gate.lock().take() } else { None };
+        if let Some(gate) = gate {
+            gate.started.notify_one();
+            gate.resume.notified().await;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -128,6 +144,7 @@ async fn mock_http(State(mock): State<Arc<Mock>>, headers: HeaderMap, Json(body)
     let account = account(&headers);
     mock.calls.lock().push((account.clone(), body.clone(), "http"));
     let mode = mock.mode.load(Ordering::Relaxed);
+    mock.await_quota_gate(&account).await;
     if account == "a" && ((1..=3).contains(&mode) || mode == 6) {
         let (status, code) = match mode {
             1 => (429, "usage_limit_reached"),
@@ -141,6 +158,9 @@ async fn mock_http(State(mock): State<Arc<Mock>>, headers: HeaderMap, Json(body)
             Json(json!({"error":{"code":code, "message":"mock error", "resets_in_seconds":3600}})),
         )
             .into_response();
+    }
+    if account == "a" && mode == 7 {
+        return Json(json!({"type":"response.failed", "response":{"error":{"code":"usage_limit_reached", "message":"mock quota error"}}})).into_response();
     }
     if account == "a" && mode == 4 {
         let event = json!({"type":"response.failed", "response":{"error":{"code":"usage_limit_reached", "message":"mock error"}}});
@@ -262,7 +282,9 @@ async fn mock_ws(State(mock): State<Arc<Mock>>, headers: HeaderMap, upgrade: Web
             };
             let body: Value = serde_json::from_str(&text).unwrap();
             mock.calls.lock().push((account.clone(), body.clone(), "ws"));
-            if account == "a" && mock.mode.load(Ordering::Relaxed) == 1 {
+            let mode = mock.mode.load(Ordering::Relaxed);
+            mock.await_quota_gate(&account).await;
+            if account == "a" && mode == 1 {
                 let error = json!({"type":"error", "status":429, "error":{"code":"usage_limit_reached", "message":"mock error", "resets_in_seconds":3600}});
                 if tx.send(Message::Text(error.to_string().into())).await.is_err() { break; }
                 continue;
@@ -691,6 +713,110 @@ async fn quota_headers_and_stream_errors_trigger_migration_on_the_next_call() {
         assert_eq!(fixture.request(Some("task"), prompt()).await.0, if mode == 4 { 429 } else { 200 });
         fixture.mock.mode.store(0, Ordering::Relaxed);
         assert_eq!(answer(&fixture.request(Some("task"), prompt()).await.1), "b");
+    }
+}
+
+#[tokio::test]
+async fn delayed_http_json_and_sse_quota_errors_preserve_newer_recovery() {
+    for (mode, converted) in [(1, false), (4, false), (7, false), (4, true), (7, true)] {
+        for newer_epoch in [false, true] {
+            let fixture = Fixture::new(Routing::RoundRobin, false).await;
+            assert_eq!(answer(&fixture.request(Some("epoch-task"), prompt()).await.1), "a");
+            let account = fixture.app.pool.all().into_iter().find(|a| a.label == "a").unwrap();
+            account.state.lock().notifications_enabled = true;
+            let gate = Arc::new(QuotaGate::default());
+            *fixture.mock.quota_gate.lock() = Some(gate.clone());
+            fixture.mock.mode.store(mode, Ordering::Relaxed);
+            let request = async {
+                if converted {
+                    reqwest::Client::new()
+                        .post(format!("{}/v1/chat/completions", fixture.proxy.url))
+                        .bearer_auth("client-one")
+                        .header("thread-id", "epoch-task")
+                        .json(&json!({"model":"gpt-6.1-sol", "messages":[{"role":"user","content":"question"}]}))
+                        .send()
+                        .await
+                        .unwrap()
+                        .bytes()
+                        .await
+                        .unwrap();
+                } else {
+                    fixture.request(Some("epoch-task"), prompt()).await;
+                }
+            };
+            let release = async {
+                tokio::time::timeout(std::time::Duration::from_secs(3), gate.started.notified()).await.unwrap();
+                if newer_epoch {
+                    let mut state = account.state.lock();
+                    state.quota_epoch += 1;
+                    crate::quota::usage(
+                        &mut state,
+                        crate::accounts::Provider::Codex,
+                        &json!({"rate_limit":{"primary_window":{"limit_window_seconds":18000,"used_percent":0,"reset_at":4102444800i64},"secondary_window":{"limit_window_seconds":604800,"used_percent":0,"reset_at":4102444800i64}}}),
+                    );
+                }
+                if newer_epoch {
+                    fixture.mock.mode.store(0, Ordering::Relaxed);
+                }
+                gate.resume.notify_one();
+            };
+            let _ = tokio::join!(request, release);
+            let state = account.state.lock();
+            assert_eq!(
+                state.quota_cooldowns.is_empty(),
+                newer_epoch,
+                "mode={mode}, converted={converted}, newer={newer_epoch}"
+            );
+            assert_eq!(state.notification_evidence.observations.iter().any(|o| o.unknown.is_some()), !newer_epoch);
+            if newer_epoch {
+                assert!(state.quota.windows.iter().all(|w| w.used == 0.0));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn reused_native_websocket_turn_captures_its_own_quota_epoch() {
+    for newer_epoch in [false, true] {
+        let fixture = Fixture::new(Routing::RoundRobin, true).await;
+        let mut socket = fixture.socket("epoch-ws-task").await;
+        let first = turn(&mut socket, prompt()).await;
+        fixture.logs(1).await;
+        let account = fixture.app.pool.all().into_iter().find(|a| a.label == "a").unwrap();
+        {
+            let mut state = account.state.lock();
+            state.notifications_enabled = true;
+            state.quota_epoch += 1; // A reused connection's next turn needs this newer epoch.
+        }
+        let gate = Arc::new(QuotaGate::default());
+        *fixture.mock.quota_gate.lock() = Some(gate.clone());
+        fixture.mock.mode.store(1, Ordering::Relaxed);
+        let body = json!({"model":"gpt-6.1-sol", "previous_response_id":first["id"], "input":"next"});
+        let request = turn(&mut socket, body);
+        let release = async {
+            tokio::time::timeout(std::time::Duration::from_secs(3), gate.started.notified()).await.unwrap();
+            if newer_epoch {
+                let mut state = account.state.lock();
+                state.quota_epoch += 1;
+                crate::quota::usage(
+                    &mut state,
+                    crate::accounts::Provider::Codex,
+                    &json!({"rate_limit":{"primary_window":{"limit_window_seconds":18000,"used_percent":0,"reset_at":4102444800i64},"secondary_window":{"limit_window_seconds":604800,"used_percent":0,"reset_at":4102444800i64}}}),
+                );
+            }
+            if newer_epoch {
+                fixture.mock.mode.store(0, Ordering::Relaxed);
+            }
+            gate.resume.notify_one();
+        };
+        let _ = tokio::join!(request, release);
+        fixture.logs(2).await;
+        let state = account.state.lock();
+        assert_eq!(state.quota_cooldowns.is_empty(), newer_epoch);
+        assert_eq!(state.notification_evidence.observations.iter().any(|o| o.unknown.is_some()), !newer_epoch);
+        let calls = fixture.mock.calls.lock();
+        assert_eq!(calls[1].2, "ws");
+        assert_eq!(fixture.mock.ws_connections.load(Ordering::Relaxed), 1, "the second turn must reuse its socket");
     }
 }
 
@@ -1224,6 +1350,7 @@ async fn websocket_native_selection_preserves_decision_when_api_keys_require_htt
         "gpt-6.1-sol",
         chrono::Utc::now() + chrono::Duration::minutes(5),
         "mock observed quota exhaustion",
+        fixture.app.pool.get(&previous).unwrap().quota_epoch(),
     );
     turn(&mut socket, prompt()).await;
     turn(&mut socket, prompt()).await;

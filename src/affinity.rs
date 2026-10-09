@@ -742,7 +742,7 @@ mod tests {
             }
             // A model change inside the same provider also preserves the subscription.
             assert_eq!(sessions.pick(&pool, &cfg, "gpt-6-astra", Some("task"), &[], None).unwrap().0.id, a.id);
-            a.exhaust("gpt-6.1-sol", Utc::now() + Duration::minutes(5), "quota exhausted");
+            a.exhaust("gpt-6.1-sol", Utc::now() + Duration::minutes(5), "quota exhausted", a.quota_epoch());
             let b = pick();
             assert_ne!(a.id, b.id);
             a.state.lock().quota_cooldowns.clear();
@@ -770,7 +770,12 @@ mod tests {
             assert_eq!(reused.account.id, first.account.id);
             assert!(reused.previous_account.is_none());
 
-            first.account.exhaust("gpt-6.1-sol", Utc::now() + Duration::minutes(5), "quota exhausted");
+            first.account.exhaust(
+                "gpt-6.1-sol",
+                Utc::now() + Duration::minutes(5),
+                "quota exhausted",
+                first.account.quota_epoch(),
+            );
             let migrated = pick();
             assert_eq!(migrated.reason, "quota_exhausted");
             assert_eq!(migrated.strategy, routing);
