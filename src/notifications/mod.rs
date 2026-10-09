@@ -36,6 +36,7 @@ pub struct Config {
     pub enabled: bool,
     pub time_zone: String,
     pub provider_logos: bool,
+    pub credential_ui_enabled: bool,
     pub credential_proxy_cidrs: Vec<String>,
     pub secrets_dir: Option<String>,
     pub ca_file: Option<String>,
@@ -48,6 +49,7 @@ impl Default for Config {
             enabled: false,
             time_zone: "UTC".into(),
             provider_logos: true,
+            credential_ui_enabled: false,
             credential_proxy_cidrs: Vec::new(),
             secrets_dir: None,
             ca_file: None,
@@ -265,7 +267,7 @@ impl Service {
                 })
                 .collect()
         });
-        json!({"enabled":cfg.notifications.enabled,"time_zone":cfg.notifications.time_zone,"active":active,"error":error,"warning":warning,"pending":pending,"destinations":destinations,"logs":logs,"capabilities":{"supported":supported,"unsupported":unsupported},"private_endpoints_restart_required":true})
+        json!({"enabled":cfg.notifications.enabled,"time_zone":cfg.notifications.time_zone,"credential_ui_enabled":cfg.notifications.credential_ui_enabled,"active":active,"error":error,"warning":warning,"pending":pending,"destinations":destinations,"logs":logs,"capabilities":{"supported":supported,"unsupported":unsupported},"private_endpoints_restart_required":true})
     }
     pub async fn test(&self, app: &App, id: &str) -> Result<Value, &'static str> {
         let cfg = app.cfg();
@@ -322,12 +324,15 @@ impl Service {
         if outcome.success { Ok(json!({"delivered":true,"http_status":outcome.status})) } else { Err(outcome.reason) }
     }
     pub fn trusted_credential_proxy(&self, peer: std::net::IpAddr) -> bool {
+        let original_peer = peer;
         let peer = match peer {
             std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(peer),
             _ => peer,
         };
         self.credential_proxy_cidrs.iter().any(|cidr| {
-            cidr.parse::<std::net::IpAddr>().is_ok_and(|ip| ip == peer) || delivery::cidr_contains(cidr, peer)
+            cidr.parse::<std::net::IpAddr>().is_ok_and(|ip| ip == peer || ip == original_peer)
+                || delivery::cidr_contains(cidr, peer)
+                || delivery::cidr_contains(cidr, original_peer)
         })
     }
     pub fn save_credentials(
@@ -337,14 +342,17 @@ impl Service {
         url: String,
         bearer_token: Option<String>,
     ) -> Result<(), &'static str> {
+        let _guard = self.credentials_write.lock();
         let cfg = app.cfg();
+        if !cfg.notifications.credential_ui_enabled {
+            return Err("credential_ui_disabled");
+        }
         let destination = cfg
             .notifications
             .destinations
             .iter()
             .find(|destination| destination.id == id)
             .ok_or("destination_unavailable")?;
-        let _guard = self.credentials_write.lock();
         if delivery::external_present(&self.secrets, destination) {
             return Err("credentials_externally_managed");
         }
@@ -358,14 +366,17 @@ impl Service {
         Ok(())
     }
     pub fn remove_credentials(&self, app: &App, id: &str) -> Result<(), &'static str> {
+        let _guard = self.credentials_write.lock();
         let cfg = app.cfg();
+        if !cfg.notifications.credential_ui_enabled {
+            return Err("credential_ui_disabled");
+        }
         let destination = cfg
             .notifications
             .destinations
             .iter()
             .find(|destination| destination.id == id)
             .ok_or("destination_unavailable")?;
-        let _guard = self.credentials_write.lock();
         if delivery::external_present(&self.secrets, destination) {
             return Err("credentials_externally_managed");
         }

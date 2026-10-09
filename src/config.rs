@@ -263,6 +263,7 @@ notifications:
   enabled: false            # configure destinations under Config → Notifications
   time-zone: UTC            # IANA time zone for message timestamps; e.g. America/Denver
   provider-logos: true      # bundled logo thumbnails for Discord alerts
+  credential-ui-enabled: false # opt in under Config → Notifications before entering secrets
   credential-proxy-cidrs: [] # exact trusted HTTPS proxy addresses; startup-only, never trust all clients
   destinations: []          # add credentials in the dashboard; private files/environment also supported
 debug: false

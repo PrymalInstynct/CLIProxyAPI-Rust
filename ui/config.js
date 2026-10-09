@@ -248,6 +248,46 @@ function notificationCredentialSecure() {
   return location.protocol === 'https:' || ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
 }
 
+function validNotificationProxy(value) {
+  if (typeof value !== 'string' || !value || value.length > 80 || /\s/.test(value)) return false;
+  const [ip, bits, extra] = value.split('/');
+  if (extra !== undefined) return false;
+  let ipv6 = false;
+  if (ip.includes(':')) {
+    try { new URL(`http://[${ip}]/`); ipv6 = true; } catch { return false; }
+  } else {
+    const octets = ip.split('.');
+    if (octets.length !== 4 || !octets.every((part) => /^(0|[1-9]\d{0,2})$/.test(part) && Number(part) <= 255)) return false;
+  }
+  return bits === undefined || (/^\d+$/.test(bits) && Number(bits) > 0 && Number(bits) <= (ipv6 ? 128 : 32));
+}
+
+function notificationSecretEntryStatus() {
+  const n = S.notifications;
+  if (configDirty() || rawDirty()) return 'Save settings to apply changes.';
+  if (!n.status) return 'Checking secret entry settings…';
+  if (!n.status.credential_ui_enabled) return 'Secret entry is off. Existing credentials keep delivering notifications.';
+  if (!notificationCredentialSecure()) return 'Use HTTPS or localhost to enter secrets.';
+  if (n.status.credential_ui_ready) return 'Ready for secret entry.';
+  if (n.status.credential_ui_reason === 'credential_https_required') return 'Your HTTPS proxy is not trusted yet. Configure its verified address, save settings, then restart the server.';
+  return 'This connection cannot enter secrets. Check your dashboard authentication and reverse proxy settings.';
+}
+
+function notificationSecretEntryHTML() {
+  const cidrs = configGet(['notifications', 'credential-proxy-cidrs']) || [];
+  const peer = S.notifications.status?.credential_proxy_peer;
+  return `<section aria-label="Secret entry"><h3>Secret entry</h3>
+    ${configSwitch(['notifications', 'credential-ui-enabled'], 'Allow secret entry', 'Enable adding, replacing and removing credentials in this dashboard. Saved credentials continue working when this is off.')}
+    <p class="cfg-description" id="notification-secret-entry-status" role="status">${esc(notificationSecretEntryStatus())}</p>
+    <details class="cfg-advanced"><summary>HTTPS reverse proxy setup<span class="cfg-chevron" aria-hidden="true">›</span></summary>
+      <p class="cfg-description">For HTTPS through a reverse proxy, trust only the proxy's exact address. Verify that it sets the HTTPS forwarding header and removes client-supplied forwarding headers. Save these settings and restart the server before entering secrets. Direct server HTTPS and localhost do not need proxy addresses.</p>
+      ${peer ? `<p class="cfg-description">The server sees this connection from <code>${esc(peer)}</code>. Verify this belongs to your reverse proxy before trusting it.</p>` : ''}
+      <div class="cfg-list-head"><h4>Trusted HTTPS proxy addresses</h4><button type="button" class="btn small" data-config-act="notification-add-proxy" ${cidrs.length >= 16 ? 'disabled' : ''}>Add proxy address</button></div>
+      ${cidrs.length ? cidrs.map((_, i) => `<div class="cfg-string-row">${configField(['notifications', 'credential-proxy-cidrs', i], `Proxy address ${i + 1}`, { required: true, placeholder: '192.0.2.10/32', restart: true })}${configRemove(['notifications', 'credential-proxy-cidrs', i], `Remove proxy address ${i + 1}`)}</div>`).join('') : '<p class="cfg-empty">No proxies trusted.</p>'}
+      ${location.protocol === 'https:' && peer ? '<button type="button" class="btn ghost small" data-config-act="notification-current-proxy">Use current proxy address</button>' : ''}
+      <p class="cfg-description">Avoid broad ranges or shared Docker gateway addresses: they can include clients other than your proxy.</p></details></section>`;
+}
+
 function notificationCredentialControls(d, saved, index) {
   const n = S.notifications;
   const dirty = configDirty() || rawDirty();
@@ -257,7 +297,9 @@ function notificationCredentialControls(d, saved, index) {
   if (!saved) return `<p class="cfg-description">${dirty ? 'Save this destination before adding credentials.' : 'Loading credential status…'}</p>${note}`;
   if (saved.credential_source === 'external') return `<p class="cfg-description">Externally managed · ${saved.credential_ready ? 'Credentials available' : 'Credentials missing or invalid'}. Update the server-provisioned files or environment variables.</p>${note}`;
   if (!saved.credential_editable) return `<p class="cfg-description">Manage credentials with server-provisioned files or environment variables on this server.</p>${note}`;
+  if (!n.status?.credential_ui_enabled) return `<p class="cfg-description">${saved.credential_configured ? 'Configured. ' : ''}Enable <strong>Allow secret entry</strong> above and save settings to manage credentials.</p>${note}`;
   if (!notificationCredentialSecure()) return `<p class="cfg-description">Open this dashboard over HTTPS or localhost to enter credentials.</p>${note}`;
+  if (!n.status?.credential_ui_ready) return `<p class="cfg-description">Complete <strong>Secret entry</strong> setup above before adding or changing credentials.</p>${note}`;
   if (n.credentialEditor === d.id) return `<div data-credential-editor="${esc(d.id)}">
       <p class="cfg-description">Enter new credentials. Saved values are never shown. Saving replaces the URL and bearer token; leave the token blank when it is not needed.</p>
       <div class="cfg-grid"><div class="field"><label for="notification-url-${index}">Webhook URL</label>
@@ -281,6 +323,7 @@ async function mutateNotificationCredentials(id, method, body) {
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
     const messages = {
+      credential_ui_disabled: 'Enable Allow secret entry in Settings before updating credentials.',
       credential_https_required: 'Use HTTPS. If you use a reverse proxy, its address must be trusted by the server.',
       credential_authorization_header_required: 'Unlock the dashboard again before updating credentials.',
       credential_origin_mismatch: 'The dashboard address does not match the secure server address. Check the reverse proxy settings.',
@@ -303,7 +346,7 @@ async function mutateNotificationCredentials(id, method, body) {
 
 async function saveNotificationCredentials(id) {
   const n = S.notifications;
-  if (n.busy || configDirty() || rawDirty()) return;
+  if (n.busy || configDirty() || rawDirty() || !n.status?.credential_ui_ready) return;
   const editor = document.querySelector(`[data-credential-editor="${CSS.escape(id)}"]`);
   if (!editor) return;
   const urlInput = editor.querySelector('[data-credential-url]');
@@ -332,7 +375,7 @@ async function saveNotificationCredentials(id) {
 
 async function removeNotificationCredentials(id) {
   const n = S.notifications;
-  if (n.busy || configDirty() || rawDirty()) return;
+  if (n.busy || configDirty() || rawDirty() || !n.status?.credential_ui_ready) return;
   n.busy = `credentials:${id}`; n.credentialRemove = null; n.credentialMsg = null; render();
   try {
     await mutateNotificationCredentials(id, 'DELETE');
@@ -354,6 +397,7 @@ function configNotificationsHTML() {
     <div class="cfg-grid">${configSelect(['notifications', 'time-zone'], 'Notification time zone', notificationTimeZones(), { help: 'Use this time zone for observed and estimated reset times. Daylight saving changes apply automatically; no restart needed.' })}</div>
     <button type="button" class="btn ghost small" data-config-act="notification-browser-zone">Use browser time zone</button>
     ${configSwitch(['notifications', 'provider-logos'], 'Provider logos', 'Add a Claude or ChatGPT logo thumbnail to Discord quota alerts. Test messages preview both logos. Other platforms keep their existing message format.')}
+    <div class="cfg-divider"></div>${notificationSecretEntryHTML()}<div class="cfg-divider"></div>
     <p class="cfg-description">Save a destination, then add its webhook URL and optional bearer token below. Credentials are saved separately from config.yaml and cannot be retrieved through the dashboard.</p>
     <details class="cfg-advanced"><summary>Advanced credential setup<span class="cfg-chevron" aria-hidden="true">›</span></summary>
       <p class="cfg-description">For server-provisioned credentials, use a private file named <code>&lt;id&gt;.url</code> in the notification secrets directory. An optional <code>&lt;id&gt;.bearer</code> file supplies a bearer token. These credentials are managed outside the dashboard.</p>
@@ -384,6 +428,9 @@ async function loadNotifications() {
   catch (e) { n.error = e.message; }
   n.loading = false;
   if (S.route === 'config' && S.config.section === 'notifications') {
+    if (!n.status?.credential_ui_ready && (n.credentialEditor || n.credentialRemove)) {
+      n.credentialEditor = null; n.credentialRemove = null; render();
+    }
     patchNotificationActivity();
     updateNotificationActions();
   }
@@ -401,19 +448,21 @@ function patchNotificationActivity() {
 function updateNotificationActions() {
   const n = S.notifications;
   const dirty = configDirty() || rawDirty();
+  const entryStatus = document.getElementById('notification-secret-entry-status');
+  if (entryStatus) entryStatus.textContent = notificationSecretEntryStatus();
   const destinations = configGet(['notifications', 'destinations']) || [];
   for (const [index, d] of destinations.entries()) {
     const panel = document.getElementById(`notification-credentials-${index}`);
     if (!panel || n.credentialEditor === d.id || n.credentialRemove === d.id) continue;
     const saved = n.status?.destinations?.find((row) => row.id === d.id);
-    const signature = JSON.stringify([d.id, saved?.credential_source, saved?.credential_configured, saved?.credential_ready, saved?.credential_editable, dirty, n.busy, n.credentialMsg]);
+    const signature = JSON.stringify([d.id, saved?.credential_source, saved?.credential_configured, saved?.credential_ready, saved?.credential_editable, n.status?.credential_ui_enabled, n.status?.credential_ui_ready, dirty, n.busy, n.credentialMsg]);
     if (panel.dataset.signature !== signature) {
       panel.innerHTML = notificationCredentialControls(d, saved, index);
       panel.dataset.signature = signature;
     }
   }
   for (const button of document.querySelectorAll('[data-config-act="save-notification-credentials"], [data-config-act="confirm-remove-notification-credentials"]')) {
-    button.disabled = dirty || !!n.busy;
+    button.disabled = dirty || !!n.busy || !n.status?.credential_ui_ready;
   }
   for (const button of document.querySelectorAll('[data-config-act="test-notification"]')) {
     const saved = n.status?.destinations?.find((row) => row.id === button.dataset.destination);
@@ -591,6 +640,11 @@ function configValidate() {
   if ('notifications' in changed) {
     const zone = v.notifications['time-zone'];
     if (typeof zone !== 'string' || !zone || zone.length > 64) invalid(['notifications', 'time-zone'], 'Choose a notification time zone.');
+    const proxies = v.notifications['credential-proxy-cidrs'] || [];
+    if (proxies.length > 16) invalid(['notifications', 'credential-proxy-cidrs'], 'Use at most 16 proxy addresses.');
+    proxies.forEach((value, i) => {
+      if (!validNotificationProxy(value)) invalid(['notifications', 'credential-proxy-cidrs', i], 'Enter an IP address or CIDR, such as 192.0.2.10/32. A /0 range is not allowed.');
+    });
     const ids = new Set();
     (v.notifications.destinations || []).forEach((d, i) => {
       const path = ['notifications', 'destinations', i];
@@ -763,6 +817,16 @@ document.addEventListener('click', (e) => {
   if (act === 'save') return saveConfig();
   if (act === 'refresh-notifications') return loadNotifications();
   if (act === 'test-notification') return testNotification(button.dataset.destination);
+  if (act === 'notification-add-proxy' || act === 'notification-current-proxy') {
+    const list = configGet(['notifications', 'credential-proxy-cidrs']) || [];
+    if (list.length >= 16) return;
+    const value = act === 'notification-current-proxy' ? S.notifications.status?.credential_proxy_cidr : '';
+    if (act === 'notification-current-proxy' && (location.protocol !== 'https:' || !validNotificationProxy(value))) return;
+    if (value && list.includes(value)) return;
+    list.push(value); configSet(['notifications', 'credential-proxy-cidrs'], list); c.msg = null; render();
+    document.getElementById(configId(['notifications', 'credential-proxy-cidrs', list.length - 1]))?.focus();
+    return;
+  }
   if (act === 'save-notification-credentials') return saveNotificationCredentials(button.dataset.destination);
   if (act === 'confirm-remove-notification-credentials') return removeNotificationCredentials(button.dataset.destination);
   if (act === 'edit-notification-credentials' || act === 'remove-notification-credentials' || act === 'cancel-notification-credentials') {

@@ -677,8 +677,18 @@ async fn get_config(State(app): State<Arc<App>>) -> Json<Value> {
     Json(json!({ "text": text, "path": app.cfg_path.display().to_string() }))
 }
 
-async fn notification_status(State(app): State<Arc<App>>) -> Response {
-    no_store(Json(app.notifications.status(&app)).into_response())
+async fn notification_status(
+    State(app): State<Arc<App>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+) -> Response {
+    let mut status = app.notifications.status(&app);
+    let guard = credential_guard(&app, peer.ip(), req.headers(), req.uri());
+    status["credential_ui_ready"] = json!(guard.is_ok());
+    status["credential_ui_reason"] = json!(guard.err().unwrap_or("ready"));
+    status["credential_proxy_peer"] = json!(peer.ip().to_string());
+    status["credential_proxy_cidr"] = json!(format!("{}/{}", peer.ip(), if peer.is_ipv4() { 32 } else { 128 }));
+    no_store(Json(status).into_response())
 }
 fn no_store(mut response: Response) -> Response {
     response.headers_mut().insert(header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
@@ -718,6 +728,9 @@ fn credential_guard(
     uri: &axum::http::Uri,
 ) -> Result<(), &'static str> {
     let cfg = app.cfg();
+    if !cfg.notifications.credential_ui_enabled {
+        return Err("credential_ui_disabled");
+    }
     if !cfg.management_key.is_empty() {
         let bearer = single_header(headers, "authorization")?
             .and_then(|value| value.strip_prefix("Bearer "))
@@ -810,7 +823,13 @@ async fn put_notification_credentials(
     match app.notifications.save_credentials(&app, &id, body.url, body.bearer_token) {
         Ok(()) => no_store(Json(json!({"saved":true})).into_response()),
         Err(message) => credential_error(
-            if message == "credentials_externally_managed" { StatusCode::CONFLICT } else { StatusCode::BAD_REQUEST },
+            if message == "credential_ui_disabled" {
+                StatusCode::FORBIDDEN
+            } else if message == "credentials_externally_managed" {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            },
             message,
         ),
     }
@@ -830,7 +849,13 @@ async fn delete_notification_credentials(
     match app.notifications.remove_credentials(&app, &id) {
         Ok(()) => no_store(Json(json!({"removed":true})).into_response()),
         Err(message) => credential_error(
-            if message == "credentials_externally_managed" { StatusCode::CONFLICT } else { StatusCode::BAD_REQUEST },
+            if message == "credential_ui_disabled" {
+                StatusCode::FORBIDDEN
+            } else if message == "credentials_externally_managed" {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            },
             message,
         ),
     }
@@ -1094,6 +1119,7 @@ mod tests {
             auth_dir: "/nonexistent/credential-h2-test".into(),
             management_key: "synthetic-h2-key".into(),
             tls: crate::config::Tls { enable: true, ..Default::default() },
+            notifications: crate::notifications::Config { credential_ui_enabled: true, ..Default::default() },
             ..Default::default()
         };
         let app = App::new(cfg, std::path::PathBuf::from("/nonexistent/credential-h2-config.yaml"));

@@ -30,6 +30,7 @@ fn app(temp: &Temp, secrets_dir: Option<&Path>) -> Arc<crate::state::App> {
         ..Default::default()
     };
     cfg.notifications.enabled = true;
+    cfg.notifications.credential_ui_enabled = true;
     cfg.notifications.secrets_dir = secrets_dir.map(|path| path.to_string_lossy().into_owned());
     cfg.notifications.destinations.push(crate::notifications::Destination {
         id: "ops".into(),
@@ -258,6 +259,60 @@ async fn loopback_http_accepts_a_localhost_host_without_forwarded_headers() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn credential_ui_is_opt_in_hot_reloadable_and_disabling_it_preserves_saved_secret() {
+    assert!(!crate::notifications::Config::default().credential_ui_enabled);
+    let temp = Temp::new();
+    let initially_enabled = app(&temp, None);
+    let mut disabled_config = (*initially_enabled.cfg()).clone();
+    disabled_config.notifications.credential_ui_enabled = false;
+    let disabled_app = crate::state::App::new(disabled_config.clone(), initially_enabled.cfg_path.clone());
+    std::fs::write(&disabled_app.cfg_path, serde_yaml::to_string(&disabled_config).unwrap()).unwrap();
+    let (origin, _server) = serve(disabled_app.clone()).await;
+    let client = reqwest::Client::new();
+    let route = credential_route(&origin, "ops");
+    let secret = "ui-gated-secret-sentinel";
+    let request = || {
+        authenticated(&client, reqwest::Method::PUT, &route, &origin)
+            .json(&json!({"url":format!("https://hooks.example.invalid/{secret}")}))
+    };
+
+    let disabled_status = client.get(format!("{origin}/api/notifications")).bearer_auth(KEY).send().await.unwrap();
+    assert_eq!(disabled_status.status(), StatusCode::OK);
+    let disabled_status: Value = disabled_status.json().await.unwrap();
+    assert_eq!(disabled_status["credential_ui_enabled"], false);
+    assert_eq!(disabled_status["credential_ui_ready"], false);
+    assert_eq!(disabled_status["credential_ui_reason"], "credential_ui_disabled");
+    assert!(disabled_status["credential_proxy_peer"].is_string());
+    assert!(disabled_status["credential_proxy_cidr"].is_string());
+
+    let disabled_put = request().send().await.unwrap();
+    assert_eq!(disabled_put.status(), StatusCode::FORBIDDEN);
+    assert!(!disabled_put.text().await.unwrap().contains(secret));
+    let disabled_delete = authenticated(&client, reqwest::Method::DELETE, &route, &origin).send().await.unwrap();
+    assert_eq!(disabled_delete.status(), StatusCode::FORBIDDEN);
+    assert!(!temp.0.join("auth/.notification-credentials").exists());
+
+    let mut hot_enabled = (*disabled_app.cfg()).clone();
+    hot_enabled.notifications.credential_ui_enabled = true;
+    disabled_app.set_config(hot_enabled);
+    let saved = request().send().await.unwrap();
+    assert_eq!(saved.status(), StatusCode::OK);
+    let credential_path = temp.0.join("auth/.notification-credentials/ops.json");
+    let saved_bytes = std::fs::read(&credential_path).unwrap();
+    assert!(String::from_utf8_lossy(&saved_bytes).contains(secret));
+
+    let mut hot_disabled = (*disabled_app.cfg()).clone();
+    hot_disabled.notifications.credential_ui_enabled = false;
+    disabled_app.set_config(hot_disabled);
+    let disabled_put = request().send().await.unwrap();
+    assert_eq!(disabled_put.status(), StatusCode::FORBIDDEN);
+    assert!(!disabled_put.text().await.unwrap().contains(secret));
+    let disabled_delete = authenticated(&client, reqwest::Method::DELETE, &route, &origin).send().await.unwrap();
+    assert_eq!(disabled_delete.status(), StatusCode::FORBIDDEN);
+    assert_eq!(std::fs::read(&credential_path).unwrap(), saved_bytes);
 }
 
 #[tokio::test]
