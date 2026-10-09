@@ -214,6 +214,20 @@ function configDiagnosticsHTML() {
 const NOTIFICATION_FORMATS = [['generic', 'Generic webhook'], ['discord', 'Discord'], ['slack', 'Slack'],
   ['mattermost', 'Mattermost'], ['teams', 'Microsoft Teams'], ['telegram', 'Telegram']];
 
+function notificationTimeZones() {
+  let zones = ['America/Denver', 'America/New_York', 'America/Chicago', 'America/Los_Angeles', 'Europe/London', 'Asia/Tokyo'];
+  try { if (Intl.supportedValuesOf) zones = Intl.supportedValuesOf('timeZone'); } catch {}
+  const current = configGet(['notifications', 'time-zone']) || 'UTC';
+  return ['UTC', ...[...new Set([...zones, current])].filter((zone) => zone !== 'UTC').sort()].map((zone) => [zone, zone]);
+}
+
+function notificationLogTime(timestamp) {
+  if (!timestamp) return '—';
+  const date = new Date(timestamp);
+  try { return date.toLocaleString(undefined, { timeZone: S.notifications.status?.time_zone || 'UTC', timeZoneName: 'short' }); }
+  catch { return date.toISOString().replace('T', ' ').replace('.000Z', ' UTC'); }
+}
+
 function notificationActivityHTML() {
   const n = S.notifications;
   const status = n.status;
@@ -225,8 +239,8 @@ function notificationActivityHTML() {
     <div class="field cfg-provider-select"><label for="notification-log-filter">Destination</label><select id="notification-log-filter" data-notification-filter><option value="">All destinations</option>
       ${[...new Set([...(status?.destinations || []).map((d) => d.id), ...(status?.logs || []).map((row) => row.destination)])].map((id) => `<option value="${esc(id)}" ${n.filter === id ? 'selected' : ''}>${esc(id)}</option>`).join('')}</select></div>
     ${logs.length ? `<div class="table-wrap notification-log"><table><thead><tr><th>Time</th><th>Destination / event</th><th>Subscription / window</th><th>Attempt</th><th>Outcome</th></tr></thead><tbody>
-      ${logs.map((row) => `<tr><td class="mono" title="${esc(row.timestamp)}">${esc(row.timestamp ? new Date(row.timestamp).toLocaleString() : '—')}</td>
-        <td>${esc(row.destination)}<small>${esc(row.event)}</small></td><td class="mono">${esc(row.subscription || '—')}<small>${esc(row.window || '—')}</small></td>
+      ${logs.map((row) => `<tr><td class="mono" title="${esc(row.timestamp)}">${esc(notificationLogTime(row.timestamp))}</td>
+        <td>${esc(row.destination)}<small>${esc(row.event)}</small></td><td>${esc(row.event === 'notification.test' ? 'Notification test' : row.display_name ? (S.private ? HIDDEN : row.display_name) : 'Subscription unavailable')}<small>${esc(row.window || '—')}</small></td>
         <td class="mono">${esc(row.attempt)}</td><td>${esc(row.outcome)}${row.detail ? `<small>${esc(row.detail)}</small>` : ''}${row.http_status ? `<small>HTTP ${esc(row.http_status)}</small>` : ''}</td></tr>`).join('')}</tbody></table></div>` : '<p class="cfg-empty">No delivery attempts to show yet. Save a destination and send a test to check its setup.</p>'}`;
 }
 
@@ -237,6 +251,9 @@ function configNotificationsHTML() {
   return `<div class="cfg-section-head"><h2>Notifications</h2><button type="button" class="btn" data-config-act="add-notification">Add destination</button></div>
     <p class="cfg-description">Get an alert when a Claude or Codex subscription hits a quota, and another when fresh provider data confirms it has recovered. A weekly limit can still block a recovered 5-hour window.</p>
     ${configSwitch(['notifications', 'enabled'], 'Quota notifications', 'Monitor all enabled Claude and Codex subscriptions, including idle accounts. Other providers do not yet expose supported quota monitoring.')}
+    <p class="cfg-description">Messages include the subscription display name from Accounts, which may be an email address.</p>
+    <div class="cfg-grid">${configSelect(['notifications', 'time-zone'], 'Notification time zone', notificationTimeZones(), { help: 'Use this time zone for observed and estimated reset times. Daylight saving changes apply automatically; no restart needed.' })}</div>
+    <button type="button" class="btn ghost small" data-config-act="notification-browser-zone">Use browser time zone</button>
     <details class="cfg-advanced"><summary>Set up credentials<span class="cfg-chevron" aria-hidden="true">›</span></summary>
       <p class="cfg-description">Credentials stay on the server. Choose a credential ID below, then provision its webhook URL in a private file named <code>&lt;id&gt;.url</code> in the server's notification secrets directory. An optional <code>&lt;id&gt;.bearer</code> file supplies a bearer token.</p>
       <p class="cfg-description">The default directory is <code>.notification-secrets</code> inside your credentials directory. Alternatively, set <code>CLIPROXYAPI_NOTIFY_&lt;ID&gt;_URL</code> and optional <code>CLIPROXYAPI_NOTIFY_&lt;ID&gt;_BEARER_TOKEN</code> before starting the server; uppercase the ID and replace hyphens with underscores. Files must have private permissions. Self-hosted private destinations need operator-configured network permissions and a restart.</p>
@@ -456,6 +473,8 @@ function configValidate() {
   }
   if ('proxy-url' in changed) checkURL(['proxy-url'], true);
   if ('notifications' in changed) {
+    const zone = v.notifications['time-zone'];
+    if (typeof zone !== 'string' || !zone || zone.length > 64) invalid(['notifications', 'time-zone'], 'Choose a notification time zone.');
     const ids = new Set();
     (v.notifications.destinations || []).forEach((d, i) => {
       const path = ['notifications', 'destinations', i];
@@ -624,6 +643,12 @@ document.addEventListener('click', (e) => {
   if (act === 'save') return saveConfig();
   if (act === 'refresh-notifications') return loadNotifications();
   if (act === 'test-notification') return testNotification(button.dataset.destination);
+  if (act === 'notification-browser-zone') {
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    configSet(['notifications', 'time-zone'], zone); c.msg = null; render();
+    document.getElementById(configId(['notifications', 'time-zone']))?.focus();
+    return;
+  }
   if (act === 'discard') return discardConfig();
   if (act === 'reload') {
     if (configDirty() || rawDirty()) { c.reloadConfirm = true; render(); return; }

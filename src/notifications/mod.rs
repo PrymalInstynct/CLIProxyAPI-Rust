@@ -29,14 +29,27 @@ fn yes() -> bool {
 fn https_port() -> u16 {
     443
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Config {
     pub enabled: bool,
+    pub time_zone: String,
     pub secrets_dir: Option<String>,
     pub ca_file: Option<String>,
     pub private_endpoints: Vec<PrivateEndpoint>,
     pub destinations: Vec<Destination>,
+}
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            time_zone: "UTC".into(),
+            secrets_dir: None,
+            ca_file: None,
+            private_endpoints: Vec::new(),
+            destinations: Vec::new(),
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
@@ -75,6 +88,9 @@ pub fn valid_id(id: &str) -> bool {
 }
 impl Config {
     pub fn validate(&self) -> Result<(), String> {
+        if self.time_zone.is_empty() || self.time_zone.len() > 64 || self.time_zone.parse::<chrono_tz::Tz>().is_err() {
+            return Err("notifications: time-zone must be a valid IANA time zone".into());
+        }
         if self.destinations.len() > 8 || self.private_endpoints.len() > 16 {
             return Err("notifications: too many destinations or private endpoints".into());
         }
@@ -181,14 +197,46 @@ impl Service {
     }
     pub fn status(&self, app: &App) -> Value {
         let cfg = app.cfg();
-        let inner = self.inner.lock();
+        let (active, error, warning, pending, installation, stored_logs) = {
+            let inner = self.inner.lock();
+            (
+                cfg.notifications.enabled && inner.store.is_some() && inner.error.is_none(),
+                inner.error,
+                inner.warning,
+                inner.store.as_ref().map_or(0, |store| store.journal.pending.len()),
+                inner.store.as_ref().map(|store| store.journal.installation.clone()),
+                inner.store.as_ref().map(|store| store.journal.logs.clone()),
+            )
+        };
         let destinations:Vec<_>=cfg.notifications.destinations.iter().map(|d|json!({"id":d.id,"format":d.format,"enabled":d.enabled,"credential_ready":delivery::credentials(&self.secrets,d).is_ok()})).collect();
         let mut supported = 0;
         let mut unsupported = 0;
+        let mut names = BTreeMap::new();
         for account in app.pool.all() {
-            if native(&account) { supported += 1 } else { unsupported += 1 }
+            if native(&account) {
+                supported += 1;
+                if let Some(salt) = installation.as_deref() {
+                    names.entry(identity(&account, salt)).or_insert_with(|| delivery::safe_name(&account.label));
+                }
+            } else {
+                unsupported += 1
+            }
         }
-        json!({"enabled":cfg.notifications.enabled,"active":cfg.notifications.enabled&&inner.store.is_some()&&inner.error.is_none(),"error":inner.error,"warning":inner.warning,"pending":inner.store.as_ref().map_or(0,|s|s.journal.pending.len()),"destinations":destinations,"logs":inner.store.as_ref().map(|s|&s.journal.logs),"capabilities":{"supported":supported,"unsupported":unsupported},"private_endpoints_restart_required":true})
+        let logs: Option<Vec<Value>> = stored_logs.map(|logs| {
+            logs.iter()
+                .map(|log| {
+                    let mut value = json!(log);
+                    let name = if log.event == "notification.test" {
+                        Some("Notification delivery test")
+                    } else {
+                        log.subscription.as_deref().and_then(|id| names.get(id).map(String::as_str))
+                    };
+                    value["display_name"] = json!(name);
+                    value
+                })
+                .collect()
+        });
+        json!({"enabled":cfg.notifications.enabled,"time_zone":cfg.notifications.time_zone,"active":active,"error":error,"warning":warning,"pending":pending,"destinations":destinations,"logs":logs,"capabilities":{"supported":supported,"unsupported":unsupported},"private_endpoints_restart_required":true})
     }
     pub async fn test(&self, app: &App, id: &str) -> Result<Value, &'static str> {
         let cfg = app.cfg();
@@ -215,8 +263,8 @@ impl Service {
             version: 1,
             id: uuid::Uuid::new_v4().to_string(),
             event: "notification.test".into(),
-            subscription: "000000000000000000000000".into(),
-            provider: "claude".into(),
+            subscription: String::new(),
+            provider: String::new(),
             window: "test".into(),
             model: None,
             observed_at: Utc::now(),
@@ -224,7 +272,10 @@ impl Service {
             used: None,
             remaining_blockers: Vec::new(),
         };
-        let outcome = delivery::send(&self.secrets, &self.private_endpoints, self.ca_file.as_deref(), &d, &event).await;
+        let presentation = delivery::Presentation::new(None, time_zone(&app.cfg().notifications));
+        let outcome =
+            delivery::send(&self.secrets, &self.private_endpoints, self.ca_file.as_deref(), &d, &event, &presentation)
+                .await;
         let mut inner = self.inner.lock();
         if let Some(store) = inner.store.as_mut() {
             store.log(log(&d.id, &event, 1, &outcome, false));
@@ -263,13 +314,23 @@ fn identity(acct: &Account, salt: &str) -> String {
     }
     hex::encode(hash.finalize())[..24].into()
 }
+fn time_zone(config: &Config) -> chrono_tz::Tz {
+    config.time_zone.parse().unwrap_or(chrono_tz::UTC)
+}
+fn display_name(app: &App, id: &str, salt: &str) -> Option<String> {
+    app.pool
+        .all()
+        .iter()
+        .find(|account| native(account) && identity(account, salt) == id)
+        .map(|account| delivery::safe_name(&account.label))
+}
 fn log(destination: &str, event: &Event, attempt: u8, outcome: &delivery::Outcome, retrying: bool) -> Log {
     Log {
         timestamp: Utc::now(),
         destination: destination.into(),
         event: event.event.clone(),
-        subscription: Some(event.subscription.clone()),
-        window: Some(event.window.clone()),
+        subscription: (event.event != "notification.test").then(|| event.subscription.clone()),
+        window: (event.event != "notification.test").then(|| event.window.clone()),
         attempt,
         outcome: if outcome.success {
             "delivered"
@@ -511,12 +572,16 @@ pub async fn worker(app: Arc<App>) {
                     let outcome = if live.notifications.enabled
                         && live.notifications.destinations.iter().any(|entry| entry.id == d.id && entry.enabled)
                     {
+                        let salt = service.inner.lock().store.as_ref().unwrap().journal.installation.clone();
+                        let name = display_name(&app, &p.event.subscription, &salt);
+                        let presentation = delivery::Presentation::new(name.as_deref(), time_zone(&live.notifications));
                         delivery::send(
                             &service.secrets,
                             &service.private_endpoints,
                             service.ca_file.as_deref(),
                             &d,
                             &p.event,
+                            &presentation,
                         )
                         .await
                     } else {
@@ -640,6 +705,29 @@ mod tests {
         assert!(bad.validate().is_err());
     }
     #[test]
+    fn old_config_and_legacy_journal_remain_loadable_without_persisting_presentation() {
+        let old: Config = serde_json::from_value(json!({"enabled":true,"destinations":[]})).unwrap();
+        assert_eq!(old.time_zone, "UTC");
+        assert!(old.validate().is_ok());
+        let mut invalid = old;
+        invalid.time_zone = "NoSuch/Zone".into();
+        assert!(invalid.validate().is_err());
+        invalid.time_zone = "America/Denver".into();
+        assert!(invalid.validate().is_ok());
+        let temp = Temp::new();
+        let store = Store::open(&temp.0).unwrap();
+        let path = temp.0.join(".quota-notifications/state.json");
+        drop(store);
+        let legacy = json!({"installation":uuid::Uuid::new_v4().to_string(),"subscriptions":{},"pending":[],"logs":[{"timestamp":"2026-01-01T12:00:00Z","destination":"test","event":"notification.test","subscription":"000000000000000000000000","window":"test","attempt":1,"outcome":"delivered","http_status":204,"detail":"accepted"}]});
+        std::fs::write(&path, legacy.to_string()).unwrap();
+        let reopened = Store::open(&temp.0).unwrap();
+        assert_eq!(reopened.journal.logs.len(), 1);
+        reopened.save().unwrap();
+        let persisted = std::fs::read_to_string(path).unwrap();
+        assert!(!persisted.contains("time_zone"));
+        assert!(!persisted.contains("display_name"));
+    }
+    #[test]
     fn network_and_secret_policy_remain_startup_only_after_management_config_reload() {
         let (_temp, app, _) = fixture(false);
         let mut cfg = (*app.cfg()).clone();
@@ -667,7 +755,10 @@ mod tests {
         let status = app.notifications.status(&app);
         assert_eq!(status["logs"][0]["detail"], "credential_unavailable");
         let serialized = status.to_string();
-        assert!(!serialized.contains("private-email-sentinel"));
+        assert!(serialized.contains("private-email-sentinel"));
+        let persisted =
+            std::fs::read_to_string(app.notifications.root.join(".quota-notifications/state.json")).unwrap();
+        assert!(!persisted.contains("private-email-sentinel"));
         assert!(!serialized.contains("private-oauth-sentinel"));
         assert!(!serialized.contains("private-provider-account"));
         {

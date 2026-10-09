@@ -185,3 +185,58 @@ async fn status_does_not_create_notification_state_when_feature_is_disabled() {
     assert_eq!(status["enabled"], false);
     assert!(!temp.0.join("auth/.quota-notifications").exists());
 }
+
+#[tokio::test]
+async fn management_settings_round_trip_timezone_and_reject_invalid_zone() {
+    let temp = Temp::new();
+    let app = app(&temp, false, None);
+    let initial = serde_yaml::to_string(&*app.cfg()).unwrap();
+    std::fs::write(&app.cfg_path, initial).unwrap();
+    let (origin, _server) = serve(app.clone()).await;
+    let client = reqwest::Client::new();
+    let settings_url = format!("{origin}/config/settings");
+
+    let defaults = client.get(&settings_url).bearer_auth("notification-test-management-key").send().await.unwrap();
+    assert_eq!(defaults.status(), StatusCode::OK);
+    let defaults: Value = defaults.json().await.unwrap();
+    assert_eq!(defaults["values"]["notifications"]["time-zone"], "UTC");
+    assert_eq!(defaults["defaults"]["notifications"]["time-zone"], "UTC");
+
+    let mut notifications = defaults["values"]["notifications"].clone();
+    notifications["time-zone"] = json!("America/Denver");
+
+    let saved = client
+        .patch(&settings_url)
+        .bearer_auth("notification-test-management-key")
+        .json(&json!({
+            "revision": defaults["revision"],
+            "changes": {"notifications": notifications}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), StatusCode::OK);
+    let saved: Value = saved.json().await.unwrap();
+    assert_eq!(saved["values"]["notifications"]["time-zone"], "America/Denver");
+    assert_eq!(app.cfg().notifications.time_zone, "America/Denver");
+    let persisted = std::fs::read_to_string(&app.cfg_path).unwrap();
+    assert_eq!(crate::config::Config::parse(&persisted).unwrap().notifications.time_zone, "America/Denver");
+
+    let mut invalid_notifications = saved["values"]["notifications"].clone();
+    invalid_notifications["time-zone"] = json!("Mars/Olympus_Mons");
+
+    let invalid = client
+        .patch(&settings_url)
+        .bearer_auth("notification-test-management-key")
+        .json(&json!({
+            "revision": saved["revision"],
+            "changes": {"notifications": invalid_notifications}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    assert!(crate::config::Config::parse("notifications:\n  time-zone: Mars/Olympus_Mons\n").is_err());
+    assert_eq!(std::fs::read_to_string(&app.cfg_path).unwrap(), persisted);
+    assert_eq!(app.cfg().notifications.time_zone, "America/Denver");
+}

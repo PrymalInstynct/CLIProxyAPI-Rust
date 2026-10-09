@@ -88,30 +88,106 @@ impl Outcome {
         Self { success: false, retry, status: None, reason, retry_after: None }
     }
 }
-fn text(e: &Event) -> String {
+/// Human presentation is resolved at send time; never serialized into the durable outbox.
+pub struct Presentation {
+    display_name: Option<String>,
+    time_zone: chrono_tz::Tz,
+}
+impl Presentation {
+    pub fn new(name: Option<&str>, time_zone: chrono_tz::Tz) -> Self {
+        Self { display_name: name.map(safe_name), time_zone }
+    }
+    fn local(&self, at: chrono::DateTime<chrono::Utc>) -> String {
+        at.with_timezone(&self.time_zone).format("%Y-%m-%d %H:%M:%S %Z (%:z)").to_string()
+    }
+}
+pub fn safe_name(name: &str) -> String {
+    let name:String=name.chars().filter(|c|!c.is_control()&&!matches!(*c,'\u{061c}'|'\u{200b}'..='\u{200f}'|'\u{2028}'..='\u{202e}'|'\u{2066}'..='\u{2069}'|'\u{feff}')).take(160).collect();
+    let name = name.trim();
+    if name.is_empty() { "Subscription".into() } else { name.into() }
+}
+fn chat_name(name: &str, format: Format) -> String {
+    let mut escaped = String::new();
+    for c in name.chars() {
+        // Break automatic mentions/email/URL links while retaining the visible name.
+        if matches!(c, '@' | '.' | ':') {
+            escaped.push(c);
+            escaped.push('\u{200b}');
+            continue;
+        }
+        if format == Format::Slack {
+            match c {
+                '&' => escaped.push_str("&amp;"),
+                '<' => escaped.push_str("&lt;"),
+                '>' => escaped.push_str("&gt;"),
+                _ => escaped.push(c),
+            }
+        } else {
+            if matches!(format, Format::Discord | Format::Mattermost | Format::Teams)
+                && matches!(c, '\\' | '*' | '_' | '`' | '~' | '[' | ']' | '(' | ')' | '<' | '>' | '|' | '#')
+            {
+                escaped.push('\\');
+            }
+            escaped.push(c);
+        }
+    }
+    escaped
+}
+fn text(e: &Event, presentation: &Presentation, format: Format) -> String {
+    if e.event == "notification.test" {
+        return format!(
+            "Notification delivery test — sent {} [{}].",
+            presentation.local(e.observed_at),
+            presentation.time_zone.name()
+        );
+    }
+    let name = chat_name(presentation.display_name.as_deref().unwrap_or("Subscription"), format);
     let mut text = format!(
-        "{}: {} subscription {} — {}{} (observed {} UTC).",
+        "{}: {} subscription {} — {}{} (observed {} [{}]).",
         e.event,
         e.provider,
-        e.subscription,
+        name,
         e.window,
         e.model.as_ref().map(|s| format!(" ({s})")).unwrap_or_default(),
-        e.observed_at.format("%Y-%m-%d %H:%M:%S")
+        presentation.local(e.observed_at),
+        presentation.time_zone.name()
     );
     if let Some(reset) = e.resets_at {
-        text.push_str(&format!(" Estimated reset {} UTC; confirmation required.", reset.format("%Y-%m-%d %H:%M:%S")));
+        text.push_str(&format!(
+            " Estimated reset {} [{}]; confirmation required.",
+            presentation.local(reset),
+            presentation.time_zone.name()
+        ));
     }
     if !e.remaining_blockers.is_empty() {
         text.push_str(&format!(" Still exhausted: {}.", e.remaining_blockers.join(", ")));
     }
     text
 }
-pub fn payload(d: &Destination, e: &Event) -> Value {
-    let text = text(e);
+pub fn payload(d: &Destination, e: &Event, presentation: &Presentation) -> Value {
+    let text = text(e, presentation, d.format);
     match d.format {
-        Format::Generic => json!(e),
+        Format::Generic => {
+            let mut value = json!(e);
+            if e.event == "notification.test" {
+                for field in ["subscription", "provider", "window", "model", "used", "remaining_blockers", "resets_at"]
+                {
+                    value.as_object_mut().unwrap().remove(field);
+                }
+                value["message"] = json!("Notification delivery test");
+            } else {
+                value["subscription_display_name"] = json!(presentation.display_name);
+            }
+            value["time_zone"] = json!(presentation.time_zone.name());
+            value["observed_at_local"] = json!(e.observed_at.with_timezone(&presentation.time_zone).to_rfc3339());
+            value["resets_at_local"] =
+                json!(e.resets_at.map(|at| at.with_timezone(&presentation.time_zone).to_rfc3339()));
+            value
+        }
         Format::Discord => json!({"content":text,"allowed_mentions":{"parse":[]}}),
-        Format::Slack => json!({"text":text,"mrkdwn":false,"unfurl_links":false,"unfurl_media":false}),
+        Format::Slack => {
+            json!({"text":text,"mrkdwn":false,"link_names":false,"unfurl_links":false,"unfurl_media":false})
+        }
         Format::Mattermost => json!({"text":text}),
         Format::Teams => {
             json!({"type":"message","attachments":[{"contentType":"application/vnd.microsoft.card.adaptive","contentUrl":null,"content":{"$schema":"http://adaptivecards.io/schemas/adaptive-card.json","type":"AdaptiveCard","version":"1.2","body":[{"type":"TextBlock","text":text,"wrap":true}]}}]})
@@ -264,6 +340,7 @@ pub async fn send(
     ca_file: Option<&Path>,
     d: &Destination,
     e: &Event,
+    presentation: &Presentation,
 ) -> Outcome {
     let secret = match credentials(dir, d) {
         Ok(secret) => secret,
@@ -273,13 +350,19 @@ pub async fn send(
         Ok(client) => client,
         Err(reason) => return Outcome::error(reason, matches!(reason, "dns_timeout" | "dns_failed")),
     };
-    dispatch(client, secret, d, e).await
+    dispatch(client, secret, d, e, presentation).await
 }
-async fn dispatch(client: reqwest::Client, mut secret: Credentials, d: &Destination, e: &Event) -> Outcome {
+async fn dispatch(
+    client: reqwest::Client,
+    mut secret: Credentials,
+    d: &Destination,
+    e: &Event,
+    presentation: &Presentation,
+) -> Outcome {
     if d.format == Format::Discord {
         secret.url.query_pairs_mut().append_pair("wait", "true");
     }
-    let mut request = client.post(secret.url).json(&payload(d, e));
+    let mut request = client.post(secret.url).json(&payload(d, e, presentation));
     if let Some(bearer) = secret.bearer {
         request = request.header(AUTHORIZATION, bearer);
     }
@@ -340,6 +423,93 @@ impl DateTimeParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn event() -> Event {
+        Event {
+            version: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            event: "quota.exhausted".into(),
+            subscription: "0123456789abcdef01234567".into(),
+            provider: "claude".into(),
+            window: "5h".into(),
+            model: None,
+            observed_at: "2026-01-01T12:00:00Z".parse().unwrap(),
+            resets_at: Some("2026-07-01T12:00:00Z".parse().unwrap()),
+            used: Some(100.0),
+            remaining_blockers: vec!["5h".into()],
+        }
+    }
+    fn destination(format: Format) -> Destination {
+        Destination { id: "test".into(), format, enabled: true, chat_id: Some("1234".into()) }
+    }
+    #[test]
+    fn human_times_follow_dst_and_generic_keeps_original_machine_identity_and_utc_times() {
+        let event = event();
+        let presentation = Presentation::new(Some("My subscription"), chrono_tz::America::Denver);
+        let human = text(&event, &presentation, Format::Telegram);
+        assert!(human.contains("My subscription"));
+        assert!(!human.contains(&event.subscription));
+        assert!(human.contains("2026-01-01 05:00:00 MST (-07:00) [America/Denver]"));
+        assert!(human.contains("2026-07-01 06:00:00 MDT (-06:00) [America/Denver]"));
+        let generic = payload(&destination(Format::Generic), &event, &presentation);
+        assert_eq!(generic["subscription"], event.subscription);
+        assert_eq!(generic["subscription_display_name"], "My subscription");
+        assert_eq!(generic["time_zone"], "America/Denver");
+        assert_eq!(generic["observed_at_local"], "2026-01-01T05:00:00-07:00");
+        assert_eq!(generic["resets_at_local"], "2026-07-01T06:00:00-06:00");
+        assert_eq!(generic["observed_at"], json!(event.observed_at));
+        assert_eq!(generic["resets_at"], json!(event.resets_at));
+    }
+    #[test]
+    fn display_names_are_bounded_single_line_and_cannot_add_mentions_links_or_markdown() {
+        let malicious = "\u{202e}@everyone [click](https://evil.example) <@U123>\r\n";
+        let safe = safe_name(malicious);
+        assert!(!safe.chars().any(char::is_control));
+        assert!(!safe.contains('\u{202e}'));
+        assert_eq!(safe_name(&"🦊".repeat(200)).chars().count(), 160);
+        assert_eq!(safe_name("\r\n\u{202e}"), "Subscription");
+        let presentation = Presentation::new(Some(malicious), chrono_tz::UTC);
+        let event = event();
+        for format in [Format::Discord, Format::Slack, Format::Mattermost, Format::Teams, Format::Telegram] {
+            let value = payload(&destination(format), &event, &presentation);
+            let text = match format {
+                Format::Discord => value["content"].as_str().unwrap(),
+                Format::Teams => value["attachments"][0]["content"]["body"][0]["text"].as_str().unwrap(),
+                _ => value["text"].as_str().unwrap(),
+            };
+            assert!(!text.contains("@everyone"));
+            assert!(!text.contains("https://evil.example"));
+            assert!(!text.contains("<@U123>"));
+            if matches!(format, Format::Discord | Format::Mattermost | Format::Teams) {
+                assert!(!text.contains("[click]("));
+            }
+            if format == Format::Discord {
+                assert_eq!(value["allowed_mentions"]["parse"], json!([]));
+            }
+            if format == Format::Slack {
+                assert_eq!(value["mrkdwn"], false);
+                assert_eq!(value["link_names"], false);
+            }
+            if format == Format::Telegram {
+                assert!(value.get("parse_mode").is_none());
+            }
+        }
+    }
+    #[test]
+    fn test_messages_have_no_fake_subscription_or_provider_even_for_legacy_events() {
+        let mut event = event();
+        event.event = "notification.test".into();
+        event.subscription = "000000000000000000000000".into();
+        let presentation = Presentation::new(None, chrono_tz::America::Denver);
+        let text = text(&event, &presentation, Format::Discord);
+        assert!(text.starts_with("Notification delivery test"));
+        assert!(!text.contains("claude"));
+        assert!(!text.contains(&event.subscription));
+        let generic = payload(&destination(Format::Generic), &event, &presentation);
+        assert_eq!(generic["message"], "Notification delivery test");
+        assert!(generic.get("subscription").is_none());
+        assert!(generic.get("provider").is_none());
+        assert!(generic.get("subscription_display_name").is_none());
+    }
     #[tokio::test]
     async fn isolated_transport_refuses_redirects_bounds_responses_and_checks_acknowledgements() {
         use axum::{
@@ -410,22 +580,55 @@ mod tests {
             url: Url::parse(&format!("http://{address}/{path}?secret-url-sentinel")).unwrap(),
             bearer: None,
         };
-        let redirect = dispatch(client.clone(), credentials("redirect"), &destination, &event).await;
+        let redirect = dispatch(
+            client.clone(),
+            credentials("redirect"),
+            &destination,
+            &event,
+            &Presentation::new(None, chrono_tz::UTC),
+        )
+        .await;
         assert_eq!(redirect.status, Some(307));
         assert!(!redirect.retry);
         assert_eq!(hits.load(Ordering::SeqCst), 0);
-        let limited = dispatch(client.clone(), credentials("limited"), &destination, &event).await;
+        let limited = dispatch(
+            client.clone(),
+            credentials("limited"),
+            &destination,
+            &event,
+            &Presentation::new(None, chrono_tz::UTC),
+        )
+        .await;
         assert_eq!(limited.status, Some(429));
         assert!(limited.retry);
         assert_eq!(limited.retry_after, Some(3600));
         assert_eq!(limited.reason, "http_rejected");
-        let oversized = dispatch(client.clone(), credentials("large"), &destination, &event).await;
+        let oversized = dispatch(
+            client.clone(),
+            credentials("large"),
+            &destination,
+            &event,
+            &Presentation::new(None, chrono_tz::UTC),
+        )
+        .await;
         assert_eq!(oversized.reason, "response_too_large");
         assert!(!oversized.retry);
         destination.format = Format::Slack;
-        assert!(dispatch(client.clone(), credentials("slack"), &destination, &event).await.success);
+        assert!(
+            dispatch(
+                client.clone(),
+                credentials("slack"),
+                &destination,
+                &event,
+                &Presentation::new(None, chrono_tz::UTC)
+            )
+            .await
+            .success
+        );
         destination.format = Format::Telegram;
-        let refused = dispatch(client, credentials("telegram"), &destination, &event).await;
+        let refused =
+            dispatch(client, credentials("telegram"), &destination, &event, &Presentation::new(None, chrono_tz::UTC))
+                .await;
         assert_eq!(refused.reason, "acknowledgement_failed");
         assert!(!refused.success);
         server.abort();

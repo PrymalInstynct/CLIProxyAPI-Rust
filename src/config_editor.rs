@@ -753,12 +753,14 @@ mod tests {
             );
             let mut notifications = values(&source).unwrap()["notifications"].clone();
             notifications["enabled"] = json!(true);
+            notifications["time-zone"] = json!("America/Denver");
             notifications["destinations"] = json!([{"id":"ops-discord","format":"discord","enabled":true}]);
             let (out, cfg) = edit(&source, json!({"notifications": notifications}));
             assert!(out.contains("# Keep this deployment note"));
             assert!(out.contains("# operator default"));
             assert_eq!(yaml(&out).unwrap()["plugin-setting"], "keep-me");
             assert!(cfg.notifications.enabled);
+            assert_eq!(cfg.notifications.time_zone, "America/Denver");
             assert_eq!(cfg.notifications.destinations[0].id, "ops-discord");
             assert_eq!(
                 yaml(&out).unwrap()["notifications"]["private-endpoints"],

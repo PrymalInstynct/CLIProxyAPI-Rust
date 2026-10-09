@@ -261,6 +261,7 @@ claude-cloak: true          # make non-Claude-Code clients look like Claude Code
 banked-resets: false        # show and spend banked Claude/ChatGPT limit resets (unofficial endpoints)
 notifications:
   enabled: false            # configure destinations under Config → Notifications
+  time-zone: UTC            # IANA time zone for message timestamps; e.g. America/Denver
   destinations: []          # webhook credentials come from private files or designated environment variables
 debug: false
 
